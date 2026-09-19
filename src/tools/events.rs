@@ -30,15 +30,23 @@ pub struct WaitArgs {
     pub timeout_seconds: Option<i64>,
     /// Restrict to certain event kinds: any of "message", "task", "lock",
     /// "note". Omit to wake on anything relevant to you. Ignored when
-    /// `task_key`/`task_keys` is set.
+    /// `task_key`/`task_keys`/`channel` is set.
     #[serde(default)]
     pub kinds: Option<Vec<String>>,
     /// Wake on channel messages from every channel, not only the one this
     /// session works in. Ignored when your session has no matching channel,
     /// where every channel already wakes you. Direct messages, tasks, locks
-    /// and notes always wake you either way.
+    /// and notes always wake you either way. Ignored when `channel` is set.
     #[serde(default)]
     pub all_channels: bool,
+    /// Wait on one specific channel by name instead of your session's own —
+    /// use this to sit in a room (e.g. a shared hypothesis/review channel)
+    /// that is not the channel named after your session. Wakes only on
+    /// messages there (plus direct messages and announcements, as usual).
+    /// Overrides `kinds` and `all_channels`. Errors if no channel has this
+    /// name — create it first with create_channel.
+    #[serde(default)]
+    pub channel: Option<String>,
     /// Wait for one specific task instead of anything on the bus: wakes only
     /// on events about the task with this key, and returns immediately if it
     /// is already `done` or `cancelled`. Overrides `kinds` and `all_channels`.
@@ -238,8 +246,9 @@ impl Bus {
                        the timeout elapses. Use this instead of polling read_messages in a loop: \
                        call it when you are waiting on teammates and idle. Returns immediately \
                        if you already have unread messages. Pass task_key to wait for one \
-                       specific task to finish instead, or task_keys to wait for whichever of \
-                       several finishes first."
+                       specific task to finish instead, task_keys to wait for whichever of \
+                       several finishes first, or channel to wait for a reply in one specific \
+                       room."
     )]
     async fn wait_for_updates(
         &self,
@@ -261,16 +270,18 @@ impl Bus {
             .chain(args.task_keys.iter().flatten().map(String::as_str))
             .collect();
         let waiting_on_tasks = !task_keys.is_empty();
+        let waiting_on_channel = args.channel.is_some();
         let kind_filter: Option<Vec<String>> = args
             .kinds
             .map(|ks| ks.into_iter().map(|k| k.trim().to_lowercase()).collect());
         let wants = |kind: &str| {
-            // A task_key/task_keys wait only ever cares about those tasks'
-            // events; it replaces whatever `kinds` was asked for rather than
-            // adding to it, since a chat message is not an answer to "is it
-            // done".
-            if waiting_on_tasks {
-                return kind == "task";
+            // task_key/task_keys/channel each narrow the wait to exactly what
+            // they name; together they replace `kinds` rather than adding to
+            // it, since a lock event is not an answer to "did she reply in
+            // the room" any more than a chat message answers "is it done".
+            if waiting_on_tasks || waiting_on_channel {
+                return (waiting_on_tasks && kind == "task")
+                    || (waiting_on_channel && kind == "message");
             }
             kind_filter
                 .as_ref()
@@ -286,15 +297,20 @@ impl Bus {
                     .is_some_and(|k| task_keys.contains(&k))
         };
 
-        // The channel this session works in, when it has one and the caller
-        // has not asked for the whole team. A window working on market-data
-        // should not be woken by core-manager chatter — that is half the point
-        // of naming a session after a repository.
-        let focus = match args.all_channels {
-            true => None,
-            false => crate::store::messaging::default_channel(&self.db, &auth)
-                .await?
-                .map(|(id, _)| id),
+        // The channel to watch: an explicit room by name, or else the
+        // channel this session works in, when it has one and the caller has
+        // not asked for the whole team. A window working on market-data
+        // should not be woken by core-manager chatter — that is half the
+        // point of naming a session after a repository.
+        let focus = if let Some(name) = &args.channel {
+            Some(crate::store::channel_id_by_name(&self.db, auth.team_id, name).await?)
+        } else {
+            match args.all_channels {
+                true => None,
+                false => crate::store::messaging::default_channel(&self.db, &auth)
+                    .await?
+                    .map(|(id, _)| id),
+            }
         };
 
         // Subscribe before checking the database so nothing slips between the
