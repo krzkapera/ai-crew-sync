@@ -30,7 +30,7 @@ pub struct WaitArgs {
     pub timeout_seconds: Option<i64>,
     /// Restrict to certain event kinds: any of "message", "task", "lock",
     /// "note". Omit to wake on anything relevant to you. Ignored when
-    /// `task_key` is set.
+    /// `task_key`/`task_keys` is set.
     #[serde(default)]
     pub kinds: Option<Vec<String>>,
     /// Wake on channel messages from every channel, not only the one this
@@ -43,9 +43,17 @@ pub struct WaitArgs {
     /// on events about the task with this key, and returns immediately if it
     /// is already `done` or `cancelled`. Overrides `kinds` and `all_channels`.
     /// Use this to block until a task you delegated is finished, then read it
-    /// with get_task. Errors if no task has this key.
+    /// with get_task. Errors if no task has this key. Can be combined with
+    /// `task_keys` — the wait then covers the union of both.
     #[serde(default)]
     pub task_key: Option<String>,
+    /// Like `task_key`, but wait for whichever of several tasks finishes
+    /// first ("one_of"): returns as soon as any key in this list is already,
+    /// or becomes, `done`/`cancelled`. Check which one with get_task on each
+    /// key, or look at the returned event's summary. Errors if any key does
+    /// not exist.
+    #[serde(default)]
+    pub task_keys: Option<Vec<String>>,
 }
 
 async fn unread_dms(pool: &PgPool, auth: &AuthCtx) -> Result<i64, sqlx::Error> {
@@ -230,7 +238,8 @@ impl Bus {
                        the timeout elapses. Use this instead of polling read_messages in a loop: \
                        call it when you are waiting on teammates and idle. Returns immediately \
                        if you already have unread messages. Pass task_key to wait for one \
-                       specific task to finish instead."
+                       specific task to finish instead, or task_keys to wait for whichever of \
+                       several finishes first."
     )]
     async fn wait_for_updates(
         &self,
@@ -242,15 +251,25 @@ impl Bus {
             .timeout_seconds
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .max(MIN_TIMEOUT_SECS);
-        let task_key = args.task_key.as_deref();
+        // task_key and task_keys are the same feature at heart — "wait for
+        // one of these keys to finish" — so both are folded into a single
+        // set up front; task_key is just the one-element case of task_keys.
+        let task_keys: Vec<&str> = args
+            .task_key
+            .iter()
+            .map(String::as_str)
+            .chain(args.task_keys.iter().flatten().map(String::as_str))
+            .collect();
+        let waiting_on_tasks = !task_keys.is_empty();
         let kind_filter: Option<Vec<String>> = args
             .kinds
             .map(|ks| ks.into_iter().map(|k| k.trim().to_lowercase()).collect());
         let wants = |kind: &str| {
-            // A task_key wait only ever cares about that one task's events;
-            // it replaces whatever `kinds` was asked for rather than adding
-            // to it, since a chat message is not an answer to "is it done".
-            if task_key.is_some() {
+            // A task_key/task_keys wait only ever cares about those tasks'
+            // events; it replaces whatever `kinds` was asked for rather than
+            // adding to it, since a chat message is not an answer to "is it
+            // done".
+            if waiting_on_tasks {
                 return kind == "task";
             }
             kind_filter
@@ -259,7 +278,12 @@ impl Bus {
                 .unwrap_or(true)
         };
         let matches_task_key = |event: &BusEvent| {
-            task_key.is_none_or(|k| event.0.get("key").and_then(|v| v.as_str()) == Some(k))
+            !waiting_on_tasks
+                || event
+                    .0
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|k| task_keys.contains(&k))
         };
 
         // The channel this session works in, when it has one and the caller
@@ -300,7 +324,7 @@ impl Bus {
         // Same race-safety rule as the message check above: rx is already
         // subscribed, so a completion that lands between this read and the
         // loop below is still caught by the loop rather than lost.
-        if let Some(key) = task_key {
+        for key in task_keys.iter().copied() {
             let detail = crate::store::tasks::get_task(&self.db, &auth, key).await?;
             if matches!(detail.task.status.as_str(), "done" | "cancelled") {
                 let holder = detail
