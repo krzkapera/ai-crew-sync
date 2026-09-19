@@ -14,7 +14,10 @@ use crate::{
 };
 
 const ASK_DEFAULT_TIMEOUT_SECS: i64 = 45;
-const ASK_MAX_TIMEOUT_SECS: i64 = 55;
+/// Floor only — no ceiling. This fork drops the upstream sub-minute cap: it
+/// existed to protect a reverse proxy sitting between caller and server, which
+/// this deployment does not have (direct local connection).
+const ASK_MIN_TIMEOUT_SECS: i64 = 1;
 
 fn default_limit() -> i64 {
     50
@@ -135,8 +138,8 @@ pub struct AskAgentArgs {
     /// `resume_message_id`.
     #[serde(default)]
     pub question: Option<String>,
-    /// How long to wait for the answer, in seconds (5-55, default 45).
-    /// Kept under a minute so HTTP intermediaries do not cut the call.
+    /// How long to wait for the answer, in seconds (default 45). No upper
+    /// bound: pass a large value to wait indefinitely for a slow teammate.
     #[serde(default)]
     pub timeout_seconds: Option<i64>,
     /// Keep waiting on an earlier question instead of sending a new one:
@@ -259,7 +262,7 @@ impl Bus {
         let timeout = args
             .timeout_seconds
             .unwrap_or(ASK_DEFAULT_TIMEOUT_SECS)
-            .clamp(5, ASK_MAX_TIMEOUT_SECS);
+            .max(ASK_MIN_TIMEOUT_SECS);
 
         let (target_name, target_session) = messaging::parse_address(&to)?;
         let target_id = agent_id_by_name(&self.db, auth.team_id, &target_name).await?;

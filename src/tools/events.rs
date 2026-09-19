@@ -17,12 +17,15 @@ use crate::{
 };
 
 const DEFAULT_TIMEOUT_SECS: i64 = 25;
-const MAX_TIMEOUT_SECS: i64 = 55;
+/// Floor only — no ceiling. This fork drops the upstream sub-minute cap: it
+/// existed to protect a reverse proxy sitting between caller and server, which
+/// this deployment does not have (direct local connection).
+const MIN_TIMEOUT_SECS: i64 = 1;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WaitArgs {
-    /// How long to wait before giving up, in seconds (5-55, default 25).
-    /// Kept under a minute so HTTP intermediaries do not cut the call.
+    /// How long to wait before giving up, in seconds (default 25). No upper
+    /// bound: pass a large value to wait indefinitely for a slow teammate.
     #[serde(default)]
     pub timeout_seconds: Option<i64>,
     /// Restrict to certain event kinds: any of "message", "task", "lock",
@@ -229,7 +232,7 @@ impl Bus {
         let timeout = args
             .timeout_seconds
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
-            .clamp(5, MAX_TIMEOUT_SECS);
+            .max(MIN_TIMEOUT_SECS);
         let kind_filter: Option<Vec<String>> = args
             .kinds
             .map(|ks| ks.into_iter().map(|k| k.trim().to_lowercase()).collect());
