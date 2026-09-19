@@ -29,7 +29,8 @@ pub struct WaitArgs {
     #[serde(default)]
     pub timeout_seconds: Option<i64>,
     /// Restrict to certain event kinds: any of "message", "task", "lock",
-    /// "note". Omit to wake on anything relevant to you.
+    /// "note". Omit to wake on anything relevant to you. Ignored when
+    /// `task_key` is set.
     #[serde(default)]
     pub kinds: Option<Vec<String>>,
     /// Wake on channel messages from every channel, not only the one this
@@ -38,6 +39,13 @@ pub struct WaitArgs {
     /// and notes always wake you either way.
     #[serde(default)]
     pub all_channels: bool,
+    /// Wait for one specific task instead of anything on the bus: wakes only
+    /// on events about the task with this key, and returns immediately if it
+    /// is already `done` or `cancelled`. Overrides `kinds` and `all_channels`.
+    /// Use this to block until a task you delegated is finished, then read it
+    /// with get_task. Errors if no task has this key.
+    #[serde(default)]
+    pub task_key: Option<String>,
 }
 
 async fn unread_dms(pool: &PgPool, auth: &AuthCtx) -> Result<i64, sqlx::Error> {
@@ -221,7 +229,8 @@ impl Bus {
                        arrives, a task changes state, a lock is released, a note is updated) or \
                        the timeout elapses. Use this instead of polling read_messages in a loop: \
                        call it when you are waiting on teammates and idle. Returns immediately \
-                       if you already have unread messages."
+                       if you already have unread messages. Pass task_key to wait for one \
+                       specific task to finish instead."
     )]
     async fn wait_for_updates(
         &self,
@@ -233,14 +242,24 @@ impl Bus {
             .timeout_seconds
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .max(MIN_TIMEOUT_SECS);
+        let task_key = args.task_key.as_deref();
         let kind_filter: Option<Vec<String>> = args
             .kinds
             .map(|ks| ks.into_iter().map(|k| k.trim().to_lowercase()).collect());
         let wants = |kind: &str| {
+            // A task_key wait only ever cares about that one task's events;
+            // it replaces whatever `kinds` was asked for rather than adding
+            // to it, since a chat message is not an answer to "is it done".
+            if task_key.is_some() {
+                return kind == "task";
+            }
             kind_filter
                 .as_ref()
                 .map(|ks| ks.iter().any(|k| k == kind))
                 .unwrap_or(true)
+        };
+        let matches_task_key = |event: &BusEvent| {
+            task_key.is_none_or(|k| event.0.get("key").and_then(|v| v.as_str()) == Some(k))
         };
 
         // The channel this session works in, when it has one and the caller
@@ -278,6 +297,31 @@ impl Bus {
             }));
         }
 
+        // Same race-safety rule as the message check above: rx is already
+        // subscribed, so a completion that lands between this read and the
+        // loop below is still caught by the loop rather than lost.
+        if let Some(key) = task_key {
+            let detail = crate::store::tasks::get_task(&self.db, &auth, key).await?;
+            if matches!(detail.task.status.as_str(), "done" | "cancelled") {
+                let holder = detail
+                    .task
+                    .claimed_by
+                    .as_deref()
+                    .map(|n| format!(" by {n}"))
+                    .unwrap_or_default();
+                return Ok(Json(WaitResult {
+                    woke: true,
+                    timed_out: false,
+                    events: vec![WaitEvent {
+                        kind: "task".into(),
+                        summary: format!("task '{key}' is already {}{holder}", detail.task.status),
+                    }],
+                    unread_direct_messages: unread_dms(&self.db, &auth).await.unwrap_or(0),
+                    suggestion: "Call get_task to see the result.".into(),
+                }));
+            }
+        }
+
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout as u64);
         let mut events: Vec<WaitEvent> = Vec::new();
 
@@ -302,6 +346,7 @@ impl Bus {
             if !event.visible_to(auth.team_id, auth.agent_id, &auth.session)
                 || !wants(event.kind())
                 || !in_focus(&event, focus)
+                || !matches_task_key(&event)
             {
                 continue;
             }
@@ -324,6 +369,7 @@ impl Bus {
                     if more.visible_to(auth.team_id, auth.agent_id, &auth.session)
                         && in_focus(&more, focus)
                         && wants(more.kind())
+                        && matches_task_key(&more)
                         && !(more.kind() == "message"
                             && more.sender_agent_id() == Some(auth.agent_id))
                         && let Some(d) = describe(&self.db, &more).await
