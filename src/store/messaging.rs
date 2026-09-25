@@ -231,6 +231,14 @@ pub fn cursor_scope(base: &str, session: &str) -> String {
     cursor_scope_for(base, session, false)
 }
 
+/// What [`cursor_scope`] appends to a base key for this session: empty for
+/// the shared session, `/s/<session>` otherwise. For SQL that builds cursor
+/// keys per row (`'channel:' || id || suffix`) and must match the keys
+/// `read_messages` writes.
+pub fn cursor_scope_suffix(session: &str) -> String {
+    cursor_scope("", session)
+}
+
 pub fn cursor_scope_for(base: &str, session: &str, all_sessions: bool) -> String {
     match (session.is_empty(), all_sessions) {
         (true, false) => base.to_owned(),

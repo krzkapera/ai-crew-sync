@@ -9,7 +9,7 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{Bus, auth_of};
+use super::{Bus, ProgressHeartbeat, auth_of};
 use crate::{
     auth::AuthCtx,
     events::BusEvent,
@@ -49,17 +49,25 @@ pub struct WaitArgs {
     pub channel: Option<String>,
 }
 
+/// Unread direct messages for this session.
+///
+/// A direct message is read once ANY cursor that covers it has passed it:
+/// reading `scope: "inbox"` moves the inbox cursor, reading `scope: "all"`
+/// moves the all cursor, and both return this message — so counting it as
+/// unread after either would report a backlog `read_messages` no longer
+/// returns.
 async fn unread_dms(pool: &PgPool, auth: &AuthCtx) -> Result<i64, sqlx::Error> {
     // This session's inbox: what is addressed to it by name, plus what is
     // addressed to the person. Another window's mail is not this window's
-    // backlog, and each keeps its own cursor.
+    // backlog, and each keeps its own cursors.
     sqlx::query_scalar(
         r#"
         SELECT count(*)
         FROM messages m
-        LEFT JOIN read_cursors c ON c.agent_id = $1 AND c.scope = $3
+        LEFT JOIN read_cursors ci ON ci.agent_id = $1 AND ci.scope = $3
+        LEFT JOIN read_cursors ca ON ca.agent_id = $1 AND ca.scope = $4
         WHERE m.recipient_agent_id = $1
-          AND m.id > COALESCE(c.last_message_id, 0)
+          AND m.id > GREATEST(COALESCE(ci.last_message_id, 0), COALESCE(ca.last_message_id, 0))
           AND (m.recipient_session IS NULL OR m.recipient_session = $2)
         "#,
     )
@@ -69,10 +77,17 @@ async fn unread_dms(pool: &PgPool, auth: &AuthCtx) -> Result<i64, sqlx::Error> {
         "inbox",
         &auth.session,
     ))
+    .bind(crate::store::messaging::cursor_scope("all", &auth.session))
     .fetch_one(pool)
     .await
 }
 
+/// Everything this session would wake for that it has not read yet.
+///
+/// Same "any covering cursor" rule as [`unread_dms`]: a channel message is
+/// read once the all cursor or that channel's cursor has passed it, a direct
+/// message once the all cursor or the inbox cursor has. Every cursor key is
+/// this session's, built exactly as `read_messages` builds it.
 async fn unread_anything(
     pool: &PgPool,
     auth: &AuthCtx,
@@ -82,9 +97,19 @@ async fn unread_anything(
         r#"
         SELECT count(*)
         FROM messages m
-        LEFT JOIN read_cursors c ON c.agent_id = $1 AND c.scope = $4
+        LEFT JOIN read_cursors ca ON ca.agent_id = $1 AND ca.scope = $4
+        LEFT JOIN read_cursors ci ON ci.agent_id = $1 AND ci.scope = $6
+        LEFT JOIN read_cursors cc
+               ON m.channel_id IS NOT NULL
+              AND cc.agent_id = $1
+              AND cc.scope = 'channel:' || m.channel_id::text || $7
         WHERE m.team_id = $2
-          AND m.id > COALESCE(c.last_message_id, 0)
+          AND m.id > GREATEST(
+                COALESCE(ca.last_message_id, 0),
+                CASE WHEN m.channel_id IS NOT NULL
+                     THEN COALESCE(cc.last_message_id, 0)
+                     ELSE COALESCE(ci.last_message_id, 0)
+                END)
           -- Same rule as the wake filter: only this session's own messages
           -- are excluded, so a sibling window's announcement still counts.
           AND NOT (m.sender_agent_id = $1 AND COALESCE(m.sender_session, '') = $3)
@@ -103,8 +128,23 @@ async fn unread_anything(
     .bind(&auth.session)
     .bind(crate::store::messaging::cursor_scope("all", &auth.session))
     .bind(focus)
+    .bind(crate::store::messaging::cursor_scope(
+        "inbox",
+        &auth.session,
+    ))
+    .bind(crate::store::messaging::cursor_scope_suffix(&auth.session))
     .fetch_one(pool)
     .await
+}
+
+/// A message this very session posted — not news to it. "You" is the
+/// session, not the person: excluding by agent alone meant an announcement
+/// from your general window never woke the repository windows it was written
+/// for, which is the coordination pattern sessions exist to enable.
+fn is_own_message(event: &BusEvent, auth: &AuthCtx) -> bool {
+    event.kind() == "message"
+        && event.sender_agent_id() == Some(auth.agent_id)
+        && event.sender_session().unwrap_or("") == auth.session
 }
 
 /// Is this event inside the session's channel focus?
@@ -302,10 +342,15 @@ impl Bus {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout as u64);
         let mut events: Vec<WaitEvent> = Vec::new();
+        let mut heartbeat = ProgressHeartbeat::new(&ctx, "wait_for_updates", Some(timeout));
 
         while events.is_empty() {
             let event = tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => break,
+                _ = heartbeat.tick() => {
+                    heartbeat.send().await;
+                    continue;
+                }
                 recv = rx.recv() => match recv {
                     Ok(ev) => ev,
                     // Lagged: we missed events; report a generic wake so the
@@ -327,15 +372,8 @@ impl Bus {
             {
                 continue;
             }
-            // Your own messages are not news to you — but "you" is this
-            // session, not the person. Excluding by agent alone meant an
-            // announcement from your general window never woke the repository
-            // windows it was written for, which is the coordination pattern
-            // sessions exist to enable.
-            if event.kind() == "message"
-                && event.sender_agent_id() == Some(auth.agent_id)
-                && event.sender_session().unwrap_or("") == auth.session
-            {
+            // Your own messages are not news to you (this session's, that is).
+            if is_own_message(&event, &auth) {
                 continue;
             }
             if let Some(described) = describe(&self.db, &event).await {
@@ -346,8 +384,9 @@ impl Bus {
                     if more.visible_to(auth.team_id, auth.agent_id, &auth.session)
                         && in_focus(&more, focus)
                         && wants(more.kind())
-                        && !(more.kind() == "message"
-                            && more.sender_agent_id() == Some(auth.agent_id))
+                        // Same session-scoped rule as the main filter: a
+                        // sibling window's message batched in here is news.
+                        && !is_own_message(&more, &auth)
                         && let Some(d) = describe(&self.db, &more).await
                     {
                         events.push(d);

@@ -3835,3 +3835,314 @@ async fn a_stringified_metadata_object_is_stored_as_an_object() {
     }
     h.shutdown().await;
 }
+
+/// A read through ANY scope that covers a message marks it read for
+/// `wait_for_updates`: the channel's own scope, `inbox`, or `all`. Before,
+/// only the `all` cursor counted, so a session that read `scope: "<channel>"`
+/// or `scope: "inbox"` was told forever that the same message was unread.
+/// Checked for a named session and for the shared (header-less) one, whose
+/// cursor keys have no session suffix.
+#[tokio::test]
+async fn any_covering_read_cursor_clears_the_wait_backlog() {
+    let h = require_db!("t_unread_cursors");
+    let joaquin_tok = seed_agent(&h.pool, "layerv", "joaquin").await;
+    let dani_tok = seed_agent(&h.pool, "layerv", "dani").await;
+    let joaquin = connect(&h.base, &joaquin_tok).await;
+    let dani = connect_with_session(&h.base, &dani_tok, "review").await;
+
+    call(&joaquin, "create_channel", json!({"name": "hypotheses"})).await;
+    let quick = json!({"timeout_seconds": 1});
+
+    // Channel message, read through the channel's own scope.
+    call(
+        &joaquin,
+        "post_message",
+        json!({"channel": "hypotheses", "body": "h1"}),
+    )
+    .await;
+    let pending = call(&dani, "wait_for_updates", quick.clone()).await;
+    assert_eq!(pending["woke"], true, "{pending}");
+    assert!(
+        pending["events"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with("1 unread"),
+        "{pending}"
+    );
+    let read = call(
+        &dani,
+        "read_messages",
+        json!({"scope": "hypotheses", "only_new": true}),
+    )
+    .await;
+    assert_eq!(read["messages"].as_array().unwrap().len(), 1, "{read}");
+    let after = call(&dani, "wait_for_updates", quick.clone()).await;
+    assert_eq!(
+        after["timed_out"], true,
+        "a message read through its channel scope is not unread: {after}"
+    );
+
+    // Direct message, read through the inbox.
+    call(
+        &joaquin,
+        "post_message",
+        json!({"to": "dani", "body": "d1"}),
+    )
+    .await;
+    let pending = call(&dani, "wait_for_updates", quick.clone()).await;
+    assert_eq!(pending["woke"], true, "{pending}");
+    assert_eq!(pending["unread_direct_messages"], 1, "{pending}");
+    let read = call(
+        &dani,
+        "read_messages",
+        json!({"scope": "inbox", "only_new": true}),
+    )
+    .await;
+    assert_eq!(read["messages"].as_array().unwrap().len(), 1, "{read}");
+    let after = call(&dani, "wait_for_updates", quick.clone()).await;
+    assert_eq!(after["timed_out"], true, "{after}");
+    assert_eq!(after["unread_direct_messages"], 0, "{after}");
+
+    // Both kinds, read through `all`: still clears both, as before.
+    call(
+        &joaquin,
+        "post_message",
+        json!({"channel": "hypotheses", "body": "h2"}),
+    )
+    .await;
+    call(
+        &joaquin,
+        "post_message",
+        json!({"to": "dani", "body": "d2"}),
+    )
+    .await;
+    let read = call(
+        &dani,
+        "read_messages",
+        json!({"scope": "all", "only_new": true}),
+    )
+    .await;
+    // `all` keeps its own read position, so it also returns h1 and d1 again
+    // (read above through other scopes); what matters is that it covers both
+    // new ones.
+    let bodies: Vec<&str> = read["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert!(bodies.contains(&"h2") && bodies.contains(&"d2"), "{read}");
+    let after = call(&dani, "wait_for_updates", quick.clone()).await;
+    assert_eq!(after["timed_out"], true, "{after}");
+    assert_eq!(after["unread_direct_messages"], 0, "{after}");
+    let me = call(&dani, "whoami", json!({})).await;
+    assert_eq!(
+        me["unread_direct_messages"], 0,
+        "whoami counts direct messages read through `all` as read: {me}"
+    );
+
+    // The shared session keeps its own cursors, keyed without a suffix:
+    // everything above is still its backlog, cleared scope by scope.
+    let shared = connect(&h.base, &dani_tok).await;
+    let pending = call(&shared, "wait_for_updates", quick.clone()).await;
+    assert!(
+        pending["events"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with("4 unread"),
+        "{pending}"
+    );
+    call(
+        &shared,
+        "read_messages",
+        json!({"scope": "hypotheses", "only_new": true}),
+    )
+    .await;
+    let pending = call(&shared, "wait_for_updates", quick.clone()).await;
+    assert!(
+        pending["events"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with("2 unread"),
+        "only the two direct messages remain: {pending}"
+    );
+    call(
+        &shared,
+        "read_messages",
+        json!({"scope": "inbox", "only_new": true}),
+    )
+    .await;
+    let after = call(&shared, "wait_for_updates", quick).await;
+    assert_eq!(after["timed_out"], true, "{after}");
+
+    for client in [joaquin, dani, shared] {
+        let _ = client.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Events that arrive inside the wake's batching window follow the same
+/// "your own messages" rule as the event that woke the wait: this session's
+/// own posts are dropped, a sibling session's are news.
+#[tokio::test]
+async fn the_batching_window_only_drops_this_sessions_own_messages() {
+    let h = require_db!("t_batch_own");
+    let token = seed_agent(&h.pool, "layerv", "joaquin").await;
+    let dani_tok = seed_agent(&h.pool, "layerv", "dani").await;
+    call(
+        &connect(&h.base, &dani_tok).await,
+        "create_channel",
+        json!({"name": "general"}),
+    )
+    .await;
+
+    let waiter = connect_with_session(&h.base, &token, "core").await;
+    let same_session = connect_with_session(&h.base, &token, "core").await;
+    let sibling = connect_with_session(&h.base, &token, "market").await;
+    let dani = connect(&h.base, &dani_tok).await;
+
+    let wait = tokio::spawn(async move {
+        let r = call(
+            &waiter,
+            "wait_for_updates",
+            json!({"timeout_seconds": 10, "kinds": ["message"]}),
+        )
+        .await;
+        let _ = waiter.cancel().await;
+        r
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Three posts back to back, well inside the 150 ms window.
+    for (client, body) in [
+        (&dani, "from dani"),
+        (&sibling, "from my market window"),
+        (&same_session, "from this very session"),
+    ] {
+        call(
+            client,
+            "post_message",
+            json!({"channel": "general", "body": body}),
+        )
+        .await;
+    }
+
+    let woke = wait.await.unwrap();
+    let summaries: Vec<&str> = woke["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["summary"].as_str().unwrap())
+        .collect();
+    assert!(summaries.iter().any(|s| s.contains("from dani")), "{woke}");
+    assert!(
+        summaries
+            .iter()
+            .any(|s| s.contains("from my market window")),
+        "a sibling session's message batched in is news: {woke}"
+    );
+    assert!(
+        !summaries
+            .iter()
+            .any(|s| s.contains("from this very session")),
+        "this session's own message is not: {woke}"
+    );
+
+    for client in [same_session, sibling, dani] {
+        let _ = client.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Split a `text/event-stream` body into the JSON-RPC messages it carries.
+fn sse_messages(body: &str) -> Vec<Value> {
+    body.split("\n\n")
+        .filter_map(|event| {
+            let data: Vec<&str> = event
+                .lines()
+                .filter_map(|l| l.strip_prefix("data:"))
+                .map(str::trim_start)
+                .collect();
+            if data.is_empty() {
+                return None;
+            }
+            serde_json::from_str(&data.join("\n")).ok()
+        })
+        .collect()
+}
+
+/// A long wait that carries a progress token sends `notifications/progress`
+/// while it waits, which turns its response into an event stream ending in
+/// the result; without a token the response stays plain JSON.
+#[tokio::test]
+async fn long_waits_send_progress_only_when_the_client_asks() {
+    let h = require_db!("t_progress");
+    let token = seed_agent(&h.pool, "layerv", "joaquin").await;
+    // Shortened for the test; only requests that carry a progress token are
+    // affected, and no other test sends one.
+    ai_crew_sync::tools::PROGRESS_HEARTBEAT_MS.store(250, std::sync::atomic::Ordering::Relaxed);
+    let http = reqwest::Client::new();
+    let post = |body: Value| {
+        http.post(format!("{}/mcp", h.base))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/json, text/event-stream")
+            .json(&body)
+            .send()
+    };
+
+    // No token: plain JSON, exactly as before.
+    let resp = post(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "wait_for_updates",
+                   "arguments": {"timeout_seconds": 1, "kinds": ["lock"]}}
+    }))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let ctype = resp.headers()["content-type"].to_str().unwrap().to_owned();
+    assert!(ctype.starts_with("application/json"), "{ctype}");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["result"]["structuredContent"]["timed_out"], true,
+        "{body}"
+    );
+
+    // With a token: progress notifications, then the result, on one stream.
+    let resp = post(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "wait_for_updates",
+                   "arguments": {"timeout_seconds": 2, "kinds": ["lock"]},
+                   "_meta": {"progressToken": "hb-1"}}
+    }))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let ctype = resp.headers()["content-type"].to_str().unwrap().to_owned();
+    assert!(ctype.starts_with("text/event-stream"), "{ctype}");
+    let messages = sse_messages(&resp.text().await.unwrap());
+    let (last, beats) = messages.split_last().expect("some messages");
+    assert_eq!(last["id"], 2, "the result comes last: {messages:?}");
+    assert_eq!(
+        last["result"]["structuredContent"]["timed_out"], true,
+        "{last}"
+    );
+    assert!(
+        beats.len() >= 3,
+        "expected several beats in 2 s: {messages:?}"
+    );
+    let mut previous = -1.0;
+    for beat in beats {
+        assert_eq!(beat["method"], "notifications/progress", "{beat}");
+        assert_eq!(beat["params"]["progressToken"], "hb-1", "{beat}");
+        assert_eq!(beat["params"]["total"], 2.0, "{beat}");
+        let progress = beat["params"]["progress"].as_f64().unwrap();
+        assert!(
+            progress >= previous,
+            "progress never goes backwards: {beats:?}"
+        );
+        previous = progress;
+    }
+
+    ai_crew_sync::tools::PROGRESS_HEARTBEAT_MS.store(60_000, std::sync::atomic::Ordering::Relaxed);
+    h.shutdown().await;
+}

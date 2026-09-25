@@ -7,7 +7,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use super::{Bus, auth_of};
+use super::{Bus, ProgressHeartbeat, auth_of};
 use crate::{
     model::{AskResult, ChannelInfo, ChannelList, MessageList, PostMessageResult},
     store::{agent_id_by_name, messaging},
@@ -90,7 +90,7 @@ pub struct PostMessageArgs {
     pub reply_to: Option<i64>,
     /// Optional structured payload attached to the message (any JSON object).
     #[serde(default)]
-    #[schemars(schema_with = "crate::model::any_json_schema")]
+    #[schemars(schema_with = "crate::model::any_object_input_schema")]
     pub metadata: Option<serde_json::Value>,
     /// Small files to ship with the message (diffs, logs, configs). Max 8
     /// files, 256 KiB each (decoded).
@@ -341,6 +341,7 @@ impl Bus {
         };
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout as u64);
+        let mut heartbeat = ProgressHeartbeat::new(&ctx, "ask_agent", Some(timeout));
         loop {
             // Check the database first: covers resumed asks whose answer
             // already landed, and events lost while lagging.
@@ -368,6 +369,7 @@ impl Bus {
             let woke = loop {
                 tokio::select! {
                     _ = tokio::time::sleep_until(deadline) => break false,
+                    _ = heartbeat.tick() => heartbeat.send().await,
                     recv = rx.recv() => match recv {
                         Ok(ev) => {
                             // Later than the question, so asking another of your

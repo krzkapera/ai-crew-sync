@@ -14,6 +14,13 @@ pub fn any_json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({})
 }
 
+/// Input-side counterpart of [`any_json_schema`]: a typed, open object.
+/// Tool input schemas become function declarations, and some model providers
+/// (Gemini) reject a property that has no `type` at all.
+pub fn any_object_input_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "object" })
+}
+
 pub fn ts(dt: chrono::DateTime<chrono::Utc>) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }

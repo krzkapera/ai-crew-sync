@@ -132,22 +132,27 @@ pub async fn channel_id_by_name(pool: &PgPool, team_id: Uuid, name: &str) -> Bus
 }
 
 pub async fn whoami(pool: &PgPool, auth: &AuthCtx) -> BusResult<WhoAmI> {
-    // This session's inbox, with this session's cursor: what another window of
-    // yours has waiting is not this window's backlog.
+    // This session's inbox, with this session's cursors: what another window
+    // of yours has waiting is not this window's backlog. Read means passed by
+    // either cursor that covers a direct message — `inbox` or `all` — the same
+    // count `wait_for_updates` reports.
     let (unread,): (i64,) = sqlx::query_as(
         r#"
         SELECT count(*)
         FROM messages m
-        LEFT JOIN read_cursors c
-               ON c.agent_id = $1 AND c.scope = $3
+        LEFT JOIN read_cursors ci
+               ON ci.agent_id = $1 AND ci.scope = $3
+        LEFT JOIN read_cursors ca
+               ON ca.agent_id = $1 AND ca.scope = $4
         WHERE m.recipient_agent_id = $1
-          AND m.id > COALESCE(c.last_message_id, 0)
+          AND m.id > GREATEST(COALESCE(ci.last_message_id, 0), COALESCE(ca.last_message_id, 0))
           AND (m.recipient_session IS NULL OR m.recipient_session = $2)
         "#,
     )
     .bind(auth.agent_id)
     .bind(&auth.session)
     .bind(messaging::cursor_scope("inbox", &auth.session))
+    .bind(messaging::cursor_scope("all", &auth.session))
     .fetch_one(pool)
     .await?;
 
