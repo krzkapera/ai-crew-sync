@@ -35,6 +35,9 @@ struct TaskRow {
     claimed_session: Option<String>,
     claimed_at: Option<chrono::DateTime<chrono::Utc>>,
     lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Decided by the database clock, the same one the writers use, so a
+    /// read never disagrees with the claim that follows it.
+    lease_expired: bool,
     result: Option<String>,
     metadata: serde_json::Value,
     attachments: serde_json::Value,
@@ -45,9 +48,35 @@ struct TaskRow {
 
 impl From<TaskRow> for TaskInfo {
     fn from(r: TaskRow) -> Self {
+        // A lapsed lease is an open task. The writers have always treated it
+        // so (anyone may claim it); a read that still said "claimed by marta"
+        // sent the reader to wait for a holder that no longer exists, or to
+        // trust a list of open tasks that left this one out. Who let it lapse
+        // stays visible, in its own field.
+        if r.lease_expired {
+            return TaskInfo {
+                key: r.key,
+                title: r.title,
+                description: r.description,
+                status: "open".to_owned(),
+                depends_on: r.depends_on,
+                blocked: r.blocked,
+                claimed_by: None,
+                claimed_session: None,
+                claimed_at: None,
+                lease_expires_at: None,
+                lease_expired: true,
+                lease_seconds_remaining: None,
+                lapsed_holder: r.claimed_by,
+                result: r.result,
+                metadata: r.metadata,
+                attachments: serde_json::from_value(r.attachments).unwrap_or_default(),
+                created_by: r.created_by,
+                created_at: ts(r.created_at),
+                updated_at: ts(r.updated_at),
+            };
+        }
         let now = chrono::Utc::now();
-        let lease_expired =
-            r.status == "claimed" && r.lease_expires_at.map(|e| e < now).unwrap_or(false);
         // Seconds, not a timestamp: an error that says "expires in 240s" tells
         // the caller whether waiting is an option; an RFC 3339 instant makes it
         // do the arithmetic first.
@@ -68,8 +97,9 @@ impl From<TaskRow> for TaskInfo {
             claimed_session: r.claimed_session.filter(|s| !s.is_empty()),
             claimed_at: ts_opt(r.claimed_at),
             lease_expires_at: ts_opt(r.lease_expires_at),
-            lease_expired,
+            lease_expired: false,
             lease_seconds_remaining,
+            lapsed_holder: None,
             result: r.result,
             metadata: r.metadata,
             attachments: serde_json::from_value(r.attachments).unwrap_or_default(),
@@ -101,6 +131,9 @@ const TASK_SELECT: &str = r#"
            t.claimed_session,
            t.claimed_at,
            t.lease_expires_at,
+           -- A claim with no expiry (a row from before leases had one) is a
+           -- live claim, not a lapsed one: NULL here would not decode.
+           COALESCE(t.status = 'claimed' AND t.lease_expires_at <= now(), false) AS lease_expired,
            t.result,
            t.metadata,
            COALESCE(
@@ -119,8 +152,16 @@ const TASK_SELECT: &str = r#"
     LEFT JOIN agents crb ON crb.id = t.created_by
 "#;
 
-async fn log_event(
-    pool: &PgPool,
+/// The status a reader is told, which is the one the writers act on: a
+/// claim whose lease lapsed is open, whatever the row still says.
+const EFFECTIVE_STATUS: &str =
+    "CASE WHEN t.status = 'claimed' AND t.lease_expires_at <= now() THEN 'open' ELSE t.status END";
+
+/// A task's history entry, always on the transaction that made the change.
+/// One that commits separately can outlive a rolled-back mutation, or be
+/// lost by one that committed and then answered the caller with an error.
+async fn log_event_tx(
+    conn: &mut sqlx::PgConnection,
     task_id: Uuid,
     agent_id: Uuid,
     event: &str,
@@ -131,7 +172,7 @@ async fn log_event(
         .bind(agent_id)
         .bind(event)
         .bind(detail)
-        .execute(pool)
+        .execute(conn)
         .await?;
     Ok(())
 }
@@ -177,18 +218,6 @@ pub async fn create_task(pool: &PgPool, auth: &AuthCtx, input: CreateInput) -> B
     super::check_metadata("task", metadata_in.as_ref())?;
     let metadata = metadata_in.unwrap_or_else(|| serde_json::Value::Object(Default::default()));
 
-    let existing: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM tasks WHERE team_id = $1 AND key = $2")
-            .bind(auth.team_id)
-            .bind(&key)
-            .fetch_optional(pool)
-            .await?;
-    if existing.is_some() {
-        return Err(BusError::conflict(format!(
-            "task '{key}' already exists; use get_task to inspect it"
-        )));
-    }
-
     if input.depends_on.len() > MAX_DEPENDENCIES {
         return Err(BusError::invalid(format!(
             "a task declares at most {MAX_DEPENDENCIES} dependencies; got {}. \
@@ -196,23 +225,61 @@ pub async fn create_task(pool: &PgPool, auth: &AuthCtx, input: CreateInput) -> B
             input.depends_on.len()
         )));
     }
-
-    // Resolve dependency keys before inserting anything, so a typo fails the
-    // whole call instead of leaving a half-registered task.
-    let mut dep_ids: Vec<Uuid> = Vec::with_capacity(input.depends_on.len());
+    let mut dep_keys: Vec<String> = Vec::with_capacity(input.depends_on.len());
     for dep_key in &input.depends_on {
         let dep_key = normalize_key(dep_key)?;
         if dep_key == key {
             return Err(BusError::invalid("a task cannot depend on itself"));
         }
-        let dep: Option<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM tasks WHERE team_id = $1 AND key = $2")
-                .bind(auth.team_id)
-                .bind(&dep_key)
-                .fetch_optional(pool)
-                .await?;
-        match dep {
-            Some((id,)) => dep_ids.push(id),
+        dep_keys.push(dep_key);
+    }
+
+    // The task, its dependencies and its `created` event commit together.
+    // Written one by one, the task was committed, open and dependency-free
+    // until its `task_deps` rows landed, so a claim in between took work
+    // whose upstream was unfinished, and a failure in between left it that
+    // way for good (#179). The NOTIFY a waiter wakes on fires at this commit
+    // too, so nobody is woken into the gap.
+    let mut tx = pool.begin().await?;
+
+    // The existence check is the insert itself: a concurrent create of the
+    // same key waits here for the other to commit and then gets the same
+    // conflict, not a unique violation.
+    let inserted: Option<(Uuid,)> = sqlx::query_as(
+        r#"
+        INSERT INTO tasks (team_id, key, title, description, metadata, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (team_id, key) DO NOTHING
+        RETURNING id
+        "#,
+    )
+    .bind(auth.team_id)
+    .bind(&key)
+    .bind(&title)
+    .bind(description.as_deref())
+    .bind(&metadata)
+    .bind(auth.agent_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((id,)) = inserted else {
+        return Err(BusError::conflict(format!(
+            "task '{key}' already exists; use get_task to inspect it"
+        )));
+    };
+
+    // Resolved inside the same transaction, so a missing key rolls the task
+    // back with it: a typo fails the whole call and leaves nothing behind.
+    let found: Vec<(String, Uuid)> =
+        sqlx::query_as("SELECT key, id FROM tasks WHERE team_id = $1 AND key = ANY($2)")
+            .bind(auth.team_id)
+            .bind(&dep_keys)
+            .fetch_all(&mut *tx)
+            .await?;
+    let found: std::collections::HashMap<String, Uuid> = found.into_iter().collect();
+    let mut dep_ids: Vec<Uuid> = Vec::with_capacity(dep_keys.len());
+    for dep_key in &dep_keys {
+        match found.get(dep_key) {
+            Some(id) => dep_ids.push(*id),
             None => {
                 return Err(BusError::not_found(format!(
                     "dependency '{dep_key}' does not exist; create it first"
@@ -223,33 +290,20 @@ pub async fn create_task(pool: &PgPool, auth: &AuthCtx, input: CreateInput) -> B
     dep_ids.sort();
     dep_ids.dedup();
 
-    let (id,): (Uuid,) = sqlx::query_as(
-        r#"
-        INSERT INTO tasks (team_id, key, title, description, metadata, created_by)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING id
-        "#,
-    )
-    .bind(auth.team_id)
-    .bind(&key)
-    .bind(&title)
-    .bind(description.as_deref())
-    .bind(&metadata)
-    .bind(auth.agent_id)
-    .fetch_one(pool)
-    .await?;
-
     // Dependencies only point at pre-existing tasks and this task is brand
     // new, so no cycle is possible by construction.
-    for dep_id in &dep_ids {
-        sqlx::query("INSERT INTO task_deps (task_id, blocked_by_task_id) VALUES ($1, $2)")
-            .bind(id)
-            .bind(dep_id)
-            .execute(pool)
-            .await?;
+    if !dep_ids.is_empty() {
+        sqlx::query(
+            "INSERT INTO task_deps (task_id, blocked_by_task_id) SELECT $1, unnest($2::uuid[])",
+        )
+        .bind(id)
+        .bind(&dep_ids)
+        .execute(&mut *tx)
+        .await?;
     }
 
-    log_event(pool, id, auth.agent_id, "created", Some(&title)).await?;
+    log_event_tx(&mut tx, id, auth.agent_id, "created", Some(&title)).await?;
+    tx.commit().await?;
     fetch_task(pool, auth, &key).await
 }
 
@@ -325,15 +379,17 @@ pub async fn list_tasks(
     let rows: Vec<TaskRow> = sqlx::query_as(AssertSqlSafe(format!(
         r#"{TASK_SELECT}
            WHERE t.team_id = $1
-             AND ($2::text IS NULL OR t.status = $2)
-             -- "mine" means this session's, matching whoami, renew and
-             -- release. Matching the agent alone would report a task your
+             AND ($2::text IS NULL OR ({EFFECTIVE_STATUS}) = $2)
+             -- "mine" means this session's live claim, matching whoami, renew
+             -- and release. Matching the agent alone would report a task your
              -- core-manager window is holding as this window's own work,
-             -- which is the duplication the session check exists to stop.
+             -- which is the duplication the session check exists to stop; a
+             -- lapsed lease is nobody's.
              AND (NOT $3::bool
-                  OR (t.claimed_by = $4 AND COALESCE(t.claimed_session, '') = $6))
+                  OR (t.claimed_by = $4 AND COALESCE(t.claimed_session, '') = $6
+                      AND COALESCE(t.lease_expires_at > now(), true)))
            ORDER BY
-             CASE t.status WHEN 'claimed' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,
+             CASE ({EFFECTIVE_STATUS}) WHEN 'claimed' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,
              t.updated_at DESC
            LIMIT $5"#
     )))
@@ -346,13 +402,13 @@ pub async fn list_tasks(
     .fetch_all(pool)
     .await?;
 
-    let (open, claimed): (i64, i64) = sqlx::query_as(
+    let (open, claimed): (i64, i64) = sqlx::query_as(AssertSqlSafe(format!(
         r#"
-        SELECT count(*) FILTER (WHERE status = 'open'),
-               count(*) FILTER (WHERE status = 'claimed')
-        FROM tasks WHERE team_id = $1
-        "#,
-    )
+        SELECT count(*) FILTER (WHERE ({EFFECTIVE_STATUS}) = 'open'),
+               count(*) FILTER (WHERE ({EFFECTIVE_STATUS}) = 'claimed')
+        FROM tasks t WHERE t.team_id = $1
+        "#
+    )))
     .bind(auth.team_id)
     .fetch_one(pool)
     .await?;
@@ -378,6 +434,11 @@ pub async fn claim_task(
     let lease = lease_seconds
         .unwrap_or(DEFAULT_LEASE_SECS)
         .clamp(30, MAX_LEASE_SECS);
+
+    // Serialised with the mutation: a request already queued when its window
+    // was resumed must not commit into the session that replaced it.
+    let mut tx = pool.begin().await?;
+    super::sessions::guard(&mut tx, auth).await?;
 
     let updated: Option<(Uuid,)> = sqlx::query_as(
         r#"
@@ -413,18 +474,22 @@ pub async fn claim_task(
     .bind(auth.team_id)
     .bind(&key)
     .bind(&auth.session)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    // The history entry commits with the claim. Written after the commit, a
+    // failed write answered "database error" for a claim that stood, so the
+    // caller held a lease it had been told it did not get.
+    if let Some((id,)) = updated {
+        log_event_tx(&mut tx, id, auth.agent_id, "claimed", None).await?;
+    }
+    tx.commit().await?;
 
     match updated {
-        Some((id,)) => {
-            log_event(pool, id, auth.agent_id, "claimed", None).await?;
-            Ok(ClaimResult {
-                claimed: true,
-                task: Some(fetch_task(pool, auth, &key).await?),
-                reason: None,
-            })
-        }
+        Some(_) => Ok(ClaimResult {
+            claimed: true,
+            task: Some(fetch_task(pool, auth, &key).await?),
+            reason: None,
+        }),
         None => {
             // Distinguish "does not exist" from "someone else holds it".
             let current = fetch_task(pool, auth, &key).await?;
@@ -492,6 +557,16 @@ async fn no_claim_here(pool: &PgPool, auth: &AuthCtx, key: &str) -> BusError {
             "you do not hold the claim on '{key}': it is {}",
             holder_reason(auth, &current)
         )),
+        Ok(current)
+            if current.lease_expired
+                && current.lapsed_holder.as_deref() == Some(auth.agent_name.as_str()) =>
+        {
+            BusError::conflict(format!(
+                "your lease on '{key}' lapsed, so the task has been open to everyone since. \
+                 If you are still working on it, claim it again (and renew before the lease \
+                 runs out next time)."
+            ))
+        }
         Ok(current) => BusError::conflict(format!(
             "you do not hold an active claim on '{key}' (it is {})",
             current.status
@@ -512,6 +587,11 @@ pub async fn claim_next_task(
     let lease = lease_seconds
         .unwrap_or(DEFAULT_LEASE_SECS)
         .clamp(30, MAX_LEASE_SECS);
+
+    // Fenced like the named claim: a replaced connection does not pick up
+    // work as the window that replaced it.
+    let mut tx = pool.begin().await?;
+    super::sessions::guard(&mut tx, auth).await?;
 
     let picked: Option<(Uuid, String)> = sqlx::query_as(
         r#"
@@ -546,30 +626,34 @@ pub async fn claim_next_task(
     .bind(auth.agent_id)
     .bind(lease as f64)
     .bind(&auth.session)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     match picked {
         Some((id, key)) => {
-            log_event(
-                pool,
+            log_event_tx(
+                &mut tx,
                 id,
                 auth.agent_id,
                 "claimed",
                 Some("via claim_next_task"),
             )
             .await?;
+            tx.commit().await?;
             Ok(ClaimResult {
                 claimed: true,
                 task: Some(fetch_task(pool, auth, &key).await?),
                 reason: None,
             })
         }
-        None => Ok(ClaimResult {
-            claimed: false,
-            task: None,
-            reason: Some("no unclaimed task available".into()),
-        }),
+        None => {
+            tx.rollback().await?;
+            Ok(ClaimResult {
+                claimed: false,
+                task: None,
+                reason: Some("no unclaimed task available".into()),
+            })
+        }
     }
 }
 
@@ -584,6 +668,10 @@ pub async fn renew_lease(
         .unwrap_or(DEFAULT_LEASE_SECS)
         .clamp(30, MAX_LEASE_SECS);
 
+    // Same fence as claiming and completing: a stale connection does not
+    // extend the replacement window's lease.
+    let mut tx = pool.begin().await?;
+    super::sessions::guard(&mut tx, auth).await?;
     let updated: Option<(Uuid,)> = sqlx::query_as(
         r#"
         UPDATE tasks
@@ -591,6 +679,10 @@ pub async fn renew_lease(
             updated_at = now()
         WHERE team_id = $2 AND key = $3 AND claimed_by = $4 AND status = 'claimed'
           AND COALESCE(claimed_session, '') = $5
+          -- A lease that lapsed is not renewed, it is claimed again: the task
+          -- has been open to everyone since, and ownership is re-established
+          -- through the same door as everyone else's.
+          AND lease_expires_at > now()
         RETURNING id
         "#,
     )
@@ -599,17 +691,23 @@ pub async fn renew_lease(
     .bind(&key)
     .bind(auth.agent_id)
     .bind(&auth.session)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     if updated.is_none() {
+        tx.rollback().await?;
         return Err(no_claim_here(pool, auth, &key).await);
     }
+    tx.commit().await?;
     fetch_task(pool, auth, &key).await
 }
 
 pub async fn release_task(pool: &PgPool, auth: &AuthCtx, key: &str) -> BusResult<TaskInfo> {
     let key = normalize_key(key)?;
+    // Fenced like the rest: a connection that has been replaced does not
+    // put back the claim its replacement is holding.
+    let mut tx = pool.begin().await?;
+    super::sessions::guard(&mut tx, auth).await?;
     let updated: Option<(Uuid,)> = sqlx::query_as(
         r#"
         UPDATE tasks
@@ -631,15 +729,19 @@ pub async fn release_task(pool: &PgPool, auth: &AuthCtx, key: &str) -> BusResult
     .bind(&key)
     .bind(auth.agent_id)
     .bind(&auth.session)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     match updated {
         Some((id,)) => {
-            log_event(pool, id, auth.agent_id, "released", None).await?;
+            log_event_tx(&mut tx, id, auth.agent_id, "released", None).await?;
+            tx.commit().await?;
             fetch_task(pool, auth, &key).await
         }
-        None => Err(no_claim_here(pool, auth, &key).await),
+        None => {
+            tx.rollback().await?;
+            Err(no_claim_here(pool, auth, &key).await)
+        }
     }
 }
 
@@ -654,6 +756,22 @@ pub async fn complete_task(
         Some(r) => Some(super::check_text("task result", r, MAX_RESULT_BYTES)?),
         None => None,
     };
+    // Serialised with the mutation, like claim_task: a request already
+    // queued when its window was resumed must not finish the work of the
+    // session that replaced it. The holder predicate below cannot catch
+    // that on its own — a resumed window has the same agent and the same
+    // label, and only the epoch tells them apart.
+    let mut tx = pool.begin().await?;
+    super::sessions::guard(&mut tx, auth).await?;
+
+    // A claim has to mean something on the way out too. Completing is the
+    // one write that ended someone else's work: anyone on the team could
+    // mark a task done while its holder was still doing it, and the holder
+    // found out when its next renew was refused with "it is done".
+    //
+    // The lease decides, exactly as it does for claiming. An unclaimed task
+    // is anyone's to finish; a claim whose lease has expired is fair game,
+    // which is what a lease is for; a live claim belongs to its holder.
     let updated: Option<(Uuid,)> = sqlx::query_as(
         r#"
         UPDATE tasks
@@ -662,22 +780,41 @@ pub async fn complete_task(
             lease_expires_at = NULL,
             updated_at = now()
         WHERE team_id = $2 AND key = $3 AND status IN ('open', 'claimed')
+          AND (
+              claimed_by IS NULL
+              OR lease_expires_at IS NULL
+              OR lease_expires_at <= now()
+              OR (claimed_by = $4 AND COALESCE(claimed_session, '') = $5)
+          )
         RETURNING id
         "#,
     )
     .bind(result.as_deref())
     .bind(auth.team_id)
     .bind(&key)
-    .fetch_optional(pool)
+    .bind(auth.agent_id)
+    .bind(&auth.session)
+    .fetch_optional(&mut *tx)
     .await?;
 
     match updated {
         Some((id,)) => {
-            log_event(pool, id, auth.agent_id, "completed", result.as_deref()).await?;
+            log_event_tx(&mut tx, id, auth.agent_id, "completed", result.as_deref()).await?;
+            tx.commit().await?;
             fetch_task(pool, auth, &key).await
         }
         None => {
+            tx.rollback().await?;
             let current = fetch_task(pool, auth, &key).await?;
+            if current.status == "claimed" {
+                // Somebody is working on it right now. Say who, and for how
+                // much longer, so the caller can do something about it.
+                return Err(BusError::conflict(format!(
+                    "task '{key}' is {}. Completing it would end work somebody else is \
+                     doing; ask them, or wait for the lease to expire.",
+                    holder_reason(auth, &current)
+                )));
+            }
             Err(BusError::conflict(format!(
                 "task '{key}' is already {}",
                 current.status

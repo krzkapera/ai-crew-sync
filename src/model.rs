@@ -41,6 +41,19 @@ pub struct WhoAmI {
     /// `null` means the shared session: you sent no header, and your presence,
     /// task claims and locks are not separated from your other sessions.
     pub session: Option<String>,
+    /// Discovery labels this session last published with `heartbeat`
+    /// (`project`, `role`). Absent until set, so a client that never labels
+    /// its windows sees exactly the response it saw before.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub role: Option<String>,
+    /// Set when this connection authenticated with a session credential:
+    /// the session label above is then *proven*, not merely asserted in a
+    /// header. `null` means a plain agent token with a header label, which
+    /// is still how every existing client connects.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_identity: Option<SessionIdentity>,
     /// Channel this session posts to when `post_message` is called with
     /// neither `channel` nor `to` — the one named after your session, if the
     /// team has one. `null` means there is none, so you must always say where
@@ -78,6 +91,12 @@ pub struct AgentInfo {
     pub branch: Option<String>,
     /// Free-text description of what this agent is currently doing.
     pub activity: Option<String>,
+    /// Discovery labels the session set about itself (see `list_sessions`).
+    /// Absent when never set.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub role: Option<String>,
     pub last_seen: Option<String>,
     /// True when *any* of this agent's sessions has a live presence lease.
     pub online: bool,
@@ -87,6 +106,37 @@ pub struct AgentInfo {
     /// at once, and each one claims tasks and holds locks independently.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub sessions: Vec<AgentSession>,
+}
+
+/// A session credential as the caller receives it. `session_token` is the
+/// secret and appears exactly once, on registration.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SessionCredential {
+    /// The credential. Store it in a private file (0600) and send it as the
+    /// bearer token from now on; it is not shown again. Absent on a renewal,
+    /// which extends the credential you already hold.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_token: Option<String>,
+    pub session_id: String,
+    /// The label this credential authenticates as.
+    pub session: String,
+    /// What a teammate puts in `to` to reach exactly this window.
+    pub address: String,
+    /// Connection epoch. Send it as `X-Crew-Epoch` to be fenced off cleanly
+    /// if another process resumes this window after you.
+    pub epoch: i64,
+    pub expires_at: String,
+    pub expires_in_seconds: i64,
+}
+
+/// What a session credential proves, reported by `whoami`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SessionIdentity {
+    pub session_id: String,
+    pub epoch: i64,
+    pub registered_at: String,
+    pub expires_at: String,
+    pub expires_in_seconds: i64,
 }
 
 /// One working context of an agent: what that session is doing right now.
@@ -99,8 +149,52 @@ pub struct AgentSession {
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub activity: Option<String>,
+    /// Discovery labels this session set about itself. Absent when never set.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub role: Option<String>,
     pub last_seen: Option<String>,
     pub online: bool,
+}
+
+/// One session as `list_sessions` reports it: addressable, with its
+/// discovery labels. Two sessions may share every label and still be two
+/// entries, because the address differs.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SessionEntry {
+    pub agent: String,
+    /// Absent for the shared session.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session: Option<String>,
+    /// What to put in `to` (or `ask_agent`'s `to`) to reach this session.
+    /// `agent/session` for a named one; the bare `agent` for the shared
+    /// session — and see `exact` before treating that as private.
+    pub address: String,
+    /// True when `address` reaches **this window and no other**. False for
+    /// the shared session, whose address is the bare agent name: that is a
+    /// broadcast to every window of that agent, named ones included, so it
+    /// is the wrong place to send a private instruction. There is no address
+    /// that reaches the shared session alone.
+    pub exact: bool,
+    pub project: Option<String>,
+    pub role: Option<String>,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    pub activity: Option<String>,
+    /// One of `active`, `idle`, `busy`, `blocked`, `offline`.
+    pub status: String,
+    pub online: bool,
+    pub last_seen: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SessionList {
+    pub sessions: Vec<SessionEntry>,
+    /// Sessions returned. When it equals the limit there may be more: narrow
+    /// with `project` or `role`.
+    pub count: usize,
+    pub limit: i64,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -201,7 +295,9 @@ pub struct TaskInfo {
     pub key: String,
     pub title: String,
     pub description: Option<String>,
-    /// One of `open`, `claimed`, `done`, `cancelled`.
+    /// One of `open`, `claimed`, `done`, `cancelled`. A claim whose lease
+    /// lapsed reads as `open`: anyone may take it, the former holder
+    /// included (see `lapsed_holder`).
     pub status: String,
     /// Keys of tasks this one depends on.
     pub depends_on: Vec<String>,
@@ -218,10 +314,14 @@ pub struct TaskInfo {
     /// steal the task, so renew the lease if you are still working on it.
     pub lease_expires_at: Option<String>,
     /// Seconds left on the claim, so you can decide whether waiting is
-    /// reasonable without doing the arithmetic. Zero means it has lapsed.
+    /// reasonable without doing the arithmetic.
     pub lease_seconds_remaining: Option<i64>,
-    /// True when the claim has already lapsed.
+    /// True when the last claim lapsed and nobody has claimed the task
+    /// since: it is `open`, and `lapsed_holder` says who let it go.
     pub lease_expired: bool,
+    /// Who held the claim that lapsed, while the task stays unclaimed. Not a
+    /// holder: nobody has to be asked before claiming it.
+    pub lapsed_holder: Option<String>,
     pub result: Option<String>,
     #[schemars(schema_with = "any_json_schema")]
     pub metadata: serde_json::Value,
@@ -413,4 +513,288 @@ pub struct DigestResult {
     pub notes_updated: Vec<DigestNote>,
     pub agents_seen: Vec<DigestAgent>,
     pub active_locks: Vec<LockInfo>,
+}
+
+// ----------------------------------------------------------- conversations --
+
+/// A project: the unit a conversation can be visible to. Access is an
+/// explicit grant, never inferred from a directory or a role label.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ProjectInfo {
+    pub id: String,
+    pub name: String,
+    /// Agents with an explicit grant. Only visible to someone who has one.
+    pub members: Vec<String>,
+    pub archived: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ProjectList {
+    pub projects: Vec<ProjectInfo>,
+}
+
+/// One conversation as a caller sees it.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConversationInfo {
+    pub id: String,
+    pub title: String,
+    /// `project` (everyone with access to the project can read it) or
+    /// `private` (only its members). Fixed at creation.
+    pub visibility: String,
+    /// Absent for a private conversation.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub project: Option<String>,
+    pub created_by: String,
+    pub created_at: String,
+    pub archived: bool,
+    /// Highest logical sequence in the thread. Messages are paged by this.
+    pub last_seq: i64,
+    /// Your own membership, when you have one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub membership: Option<MembershipInfo>,
+    /// Everyone in the thread. Only returned to a member.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub members: Vec<MembershipInfo>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct MembershipInfo {
+    pub membership_id: String,
+    pub agent: String,
+    /// Absent for the shared session.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session: Option<String>,
+    /// `agent/session`, or the bare agent for the shared session.
+    pub address: String,
+    /// `owner`, `moderator`, `participant` or `observer`.
+    pub role: String,
+    /// `invited`, `active`, `left` or `removed`.
+    pub state: String,
+    /// Lowest sequence this member may read; `null` means from the start.
+    pub history_from_seq: Option<i64>,
+    pub invited_at: String,
+    pub accepted_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConversationList {
+    pub conversations: Vec<ConversationInfo>,
+}
+
+/// What a send returns. `stored` and `publication` are facts about
+/// persistence at the moment of this reply, never about anyone having read
+/// anything.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SentMessage {
+    pub message_id: String,
+    pub conversation_id: String,
+    pub seq: i64,
+    /// True when the backend that holds this body had confirmed it when this
+    /// reply was written. On a thread stored in Postgres that is the send's
+    /// own commit, so it is always true. On a thread published through an
+    /// outbox (a team routed to JetStream) the send is accepted and recorded
+    /// first and the backend's answer comes later, so a fresh send says
+    /// `false` with `publication: "pending_publication"`. That state is not
+    /// final: it settles as `stored`, or as `failed` if the backend refuses
+    /// the body for good. While it is pending, do NOT send the message again.
+    /// Watch it settle with
+    /// `get_conversation_message` or `get_message_receipts` (`stored_at`),
+    /// or repeat the call with the same `request_id`, which returns the same
+    /// message with its current state.
+    pub stored: bool,
+    /// Where the body stands with its backend right now, in the same words
+    /// a read of the message uses: `stored`, `pending_publication`
+    /// (accepted, not yet confirmed) or `failed` (it will not be published;
+    /// the message keeps its place and the gap stays visible). `stored` is
+    /// true exactly when this is `"stored"`.
+    pub publication: String,
+    /// Who the message was addressed to, snapshotted now. A later join never
+    /// enters this list.
+    pub recipients: Vec<String>,
+    pub created_at: String,
+}
+
+/// One message of a thread.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConversationMessage {
+    pub message_id: String,
+    pub seq: i64,
+    pub from: String,
+    /// `agent/session` of the sender, for an exact reply.
+    pub from_address: String,
+    /// The text the sender wrote, or an EMPTY STRING when `unavailable` is
+    /// set. Check `unavailable` before quoting or summarising: an empty
+    /// body with a reason there is a body this bus cannot give you — not
+    /// yet, or not any more — never an empty message from your teammate.
+    pub body: String,
+    pub reply_to: Option<String>,
+    pub metadata: serde_json::Value,
+    pub created_at: String,
+    /// Your own observations on this message, when you are a recipient.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub my_receipt: Option<ReceiptInfo>,
+    /// Where this body stands with the backend that holds it: `stored`
+    /// normally, and `pending_publication`, `failed` or `tombstoned` when
+    /// the body is not here. A thread on the default Postgres backend is
+    /// always `stored`.
+    pub publication: String,
+    /// Always present. `null` when `body` is the real text; otherwise why
+    /// the body is not here, and `body` is an empty placeholder. The reason
+    /// says which case it is: a backend that cannot be reached right now
+    /// (try again later), a body that was never stored, or one the backend
+    /// no longer holds (those two will not come back). The message keeps
+    /// its place in the sequence, its sender and its receipts either way: a
+    /// gap you can see and read about is not the same as a gap.
+    #[serde(default)]
+    pub unavailable: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConversationRead {
+    pub conversation_id: String,
+    pub messages: Vec<ConversationMessage>,
+    /// Pass as `after_seq` to continue. Absent when the thread is exhausted.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub next_after_seq: Option<i64>,
+    /// Lowest sequence you may read in this thread.
+    pub history_from_seq: Option<i64>,
+}
+
+/// One reference to a message, as a recipient's inbox hands it over. It
+/// carries no body: the body is read separately, with a current access
+/// check at that moment.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct InboxReference {
+    /// Pass this to `confirm_inbox_delivery` once you hold the reference
+    /// durably. Until you do, nothing has been marked delivered.
+    pub delivery_id: String,
+    pub message_id: String,
+    pub conversation_id: String,
+    pub seq: i64,
+    pub from: String,
+    /// `agent/session` of the sender, for an exact reply.
+    pub from_address: String,
+    pub created_at: String,
+    /// True when this reference has been offered before: an earlier
+    /// confirmation was lost, or the process holding it went away. Handling
+    /// it twice must change nothing.
+    pub redelivered: bool,
+    /// `broker` when it came from the durable inbox, `bus` when it was
+    /// rebuilt from the bus's own records after an expiry, a deleted
+    /// consumer, or a team that is not routed to a broker at all.
+    pub source: String,
+    /// `message` — this message was addressed to you — or `receipt`: a
+    /// message *you sent* has a receipt worth reading again. A receipt
+    /// reference never means someone read anything; `get_message_receipts`
+    /// says what actually happened.
+    pub kind: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct InboxBatch {
+    pub references: Vec<InboxReference>,
+    /// How many of them the broker supplied. The rest were rebuilt from the
+    /// bus's own records, which are the authority.
+    pub from_broker: i64,
+    /// True when the batch filled: call again.
+    pub more: bool,
+    /// Present when something is worth saying about where these references
+    /// came from: an unreachable broker, a missing consumer, a team whose
+    /// conversations live on Postgres.
+    ///
+    /// Written for you, not for an operator. It never carries backend
+    /// detail — no stream names, no error codes, no credentials — and never
+    /// asks you to run something only an operator can; that detail is in
+    /// the server log. A note is not an error and not a reason to retry the
+    /// call that produced it: the page beside it is complete either way.
+    /// It never decides pagination: when it mentions paging it only repeats
+    /// that `more` is the authority, and `more` alone says whether to call
+    /// again.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub note: Option<String>,
+}
+
+/// What one window's inbox holds. The two sides are reported separately on
+/// purpose: they answer different questions, and averaging them would hide
+/// exactly the case worth seeing.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct InboxState {
+    pub address: String,
+    /// Messages addressed to this window that it has never confirmed
+    /// holding. The authoritative number.
+    pub undelivered: i64,
+    /// References handed to a process that has not confirmed them. A
+    /// non-zero number here after a crash is expected: they are offered
+    /// again.
+    pub handed_out_unconfirmed: i64,
+    /// What the broker still holds for this window, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub broker_pending: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub broker_awaiting_ack: Option<i64>,
+    /// False means the durable consumer is gone (expired, or removed).
+    /// That is not an empty inbox: the bus's own records still have it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub broker_consumer_present: Option<bool>,
+}
+
+/// Five independent observations. An absent timestamp means *not observed*,
+/// never "assumed": a cursor moving is not a person reading, and a host that
+/// cannot confirm injection leaves `presented_at` null.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ReceiptInfo {
+    pub agent: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session: Option<String>,
+    pub address: String,
+    pub stored_at: Option<String>,
+    pub delivered_at: Option<String>,
+    /// Null when the host cannot confirm the message reached the model. That
+    /// is unknown, not "no".
+    pub presented_at: Option<String>,
+    pub acknowledged_at: Option<String>,
+    /// The recipient said it acted on this. It does not complete a task or
+    /// merge anything by itself.
+    pub resolved_at: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct MessageReceipts {
+    pub message_id: String,
+    pub seq: i64,
+    /// One entry per recipient at acceptance time.
+    pub receipts: Vec<ReceiptInfo>,
+    pub acknowledged: usize,
+    pub resolved: usize,
+    pub total: usize,
+}
+
+/// What `wait_for_conversation_updates` reports.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConversationUpdates {
+    pub conversations: Vec<ConversationActivity>,
+    pub waited_seconds: i64,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConversationActivity {
+    pub conversation_id: String,
+    pub title: String,
+    /// Highest sequence currently stored in the thread. It is not a read
+    /// cursor: it does not move with what you have read or acknowledged.
+    pub last_seq: i64,
+    /// Messages addressed to you that you have not acknowledged.
+    pub unacknowledged: i64,
+}
+
+/// Result of a membership transfer proposal or acceptance.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TransferResult {
+    pub conversation_id: String,
+    /// The membership that will be superseded once the target accepts.
+    pub from_address: String,
+    pub to_address: String,
+    pub state: String,
 }

@@ -71,9 +71,9 @@ const MESSAGE_SELECT: &str = r#"
            ) AS attachments,
            m.created_at
     FROM messages m
-    JOIN agents s        ON s.id = m.sender_agent_id
+    JOIN agents s ON s.id = m.sender_agent_id
     LEFT JOIN channels ch ON ch.id = m.channel_id
-    LEFT JOIN agents r    ON r.id = m.recipient_agent_id
+    LEFT JOIN agents r ON r.id = m.recipient_agent_id
 "#;
 
 // ---------------------------------------------------------------- channels --
@@ -203,14 +203,33 @@ pub async fn default_channel(pool: &PgPool, auth: &AuthCtx) -> BusResult<Option<
     if auth.session.is_empty() {
         return Ok(None);
     }
-    let name = normalize_channel(&auth.session);
-    let row: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM channels WHERE team_id = $1 AND name = $2")
-            .bind(auth.team_id)
-            .bind(&name)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.map(|r| (r.0, name)))
+    // The project label first: a session whose label is an opaque id (the
+    // stdio proxy mints those) still posts to the channel named after the
+    // project it declared. Then the session name itself, which is how
+    // clients that name sessions after repositories have always worked.
+    // An opaque label matches no channel and gets no default, rather than
+    // one it never asked for.
+    let (project, _) = super::presence::labels_of(pool, auth).await?;
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(p) = project.filter(|p| !p.is_empty()) {
+        candidates.push(normalize_channel(&p));
+    }
+    let by_session = normalize_channel(&auth.session);
+    if !candidates.contains(&by_session) {
+        candidates.push(by_session);
+    }
+    for name in candidates {
+        let row: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM channels WHERE team_id = $1 AND name = $2")
+                .bind(auth.team_id)
+                .bind(&name)
+                .fetch_optional(pool)
+                .await?;
+        if let Some((id,)) = row {
+            return Ok(Some((id, name)));
+        }
+    }
+    Ok(None)
 }
 
 /// Read-cursor key for a scope, kept apart per session and per view.
@@ -402,6 +421,9 @@ pub async fn post_message(
     // Message + attachments commit together, so the NOTIFY that wakes
     // teammates only fires once everything is readable.
     let mut tx = pool.begin().await?;
+    // And a window that was resumed away cannot post as the session that
+    // replaced it: the check shares this transaction.
+    super::sessions::guard(&mut tx, auth).await?;
 
     let (id,): (i64,) = sqlx::query_as(
         r#"
@@ -600,9 +622,14 @@ pub async fn read_messages(
         0
     };
 
-    // Ordered ascending so the agent reads the conversation in chronological
-    // order; when not filtering by cursor we take the newest `limit` and then
-    // flip them back, so "the last N messages" is what you get.
+    // Two different pages. A cursor read (`only_new`) is a backlog drained
+    // oldest first: the page is the oldest messages past the cursor, and
+    // the cursor moves to the end of that page, so what was not returned
+    // is still ahead of it. Taking the newest page there and moving the
+    // cursor past it silently lost everything older than the page. A
+    // history read (`only_new: false`) is "the last N": the newest page,
+    // flipped back into chronological order.
+    let order = if input.only_new { "ASC" } else { "DESC" };
     let rows: Vec<MessageRow> = match &scope {
         Scope::All => {
             sqlx::query_as(AssertSqlSafe(format!(
@@ -615,7 +642,7 @@ pub async fn read_messages(
                                    OR m.recipient_session IS NULL
                                    OR m.recipient_session = $6))
                           OR m.sender_agent_id = $3)
-                   ORDER BY m.id DESC
+                   ORDER BY m.id {order}
                    LIMIT $4"#
             )))
             .bind(auth.team_id)
@@ -635,7 +662,7 @@ pub async fn read_messages(
                      AND ($4::bool
                           OR m.recipient_session IS NULL
                           OR m.recipient_session = $5)
-                   ORDER BY m.id DESC
+                   ORDER BY m.id {order}
                    LIMIT $3"#
             )))
             .bind(auth.agent_id)
@@ -650,7 +677,7 @@ pub async fn read_messages(
             sqlx::query_as(AssertSqlSafe(format!(
                 r#"{MESSAGE_SELECT}
                    WHERE m.channel_id = $1 AND m.id > $2
-                   ORDER BY m.id DESC
+                   ORDER BY m.id {order}
                    LIMIT $3"#
             )))
             .bind(*id)
@@ -663,10 +690,17 @@ pub async fn read_messages(
 
     let truncated = rows.len() as i64 == limit;
     let mut messages: Vec<MessageInfo> = rows.into_iter().map(Into::into).collect();
-    messages.reverse();
+    if !input.only_new {
+        messages.reverse();
+    }
 
     let new_cursor = messages.iter().map(|m| m.id).max().unwrap_or(since);
     if input.only_new && new_cursor > since {
+        // The cursor is this window's. Advanced by a connection that has
+        // been replaced, the live window never sees those messages: they
+        // are "already read" by a process that is gone.
+        let mut tx = pool.begin().await?;
+        super::sessions::guard(&mut tx, auth).await?;
         sqlx::query(
             r#"
             INSERT INTO read_cursors (agent_id, scope, last_message_id)
@@ -679,8 +713,9 @@ pub async fn read_messages(
         .bind(auth.agent_id)
         .bind(&cursor_key)
         .bind(new_cursor)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
     }
 
     Ok(MessageList {

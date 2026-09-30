@@ -69,10 +69,14 @@ fn render_task_line(t: &Value) {
             None => format!(" ({h})"),
         })
         .unwrap_or_default();
-    let expired = if t["lease_expired"].as_bool() == Some(true) {
-        " [lease expired]"
-    } else {
-        ""
+    // A lapsed lease reads as open; who let it lapse is still worth a glance.
+    let expired = match (
+        t["lease_expired"].as_bool() == Some(true),
+        t["lapsed_holder"].as_str(),
+    ) {
+        (true, Some(who)) => format!(" [lease lapsed: {who}]"),
+        (true, None) => " [lease lapsed]".to_owned(),
+        _ => String::new(),
     };
     println!(
         "{:<24} {:<8}{}{} {}",
@@ -149,6 +153,31 @@ pub(super) fn render(cmd: &ClientCmd, value: &Value) -> anyhow::Result<()> {
                     c["message_count"],
                     field(c, "topic"),
                 );
+            }
+        }
+        ClientCmd::Sessions { .. } => {
+            let sessions = value["sessions"].as_array().cloned().unwrap_or_default();
+            if sessions.is_empty() {
+                println!("(no sessions)");
+            }
+            for s in &sessions {
+                let labels = match (s["project"].as_str(), s["role"].as_str()) {
+                    (Some(p), Some(r)) => format!("{p}/{r}"),
+                    (Some(p), None) => p.to_owned(),
+                    (None, Some(r)) => format!("-/{r}"),
+                    _ => "-".to_owned(),
+                };
+                println!(
+                    "{:<36} {:<8} {:<28}{} {}",
+                    field(s, "address"),
+                    field(s, "status"),
+                    labels,
+                    agent_place(s),
+                    field(s, "activity"),
+                );
+            }
+            if value["count"] == value["limit"] {
+                println!("(limit reached: narrow with --project or --role)");
             }
         }
         ClientCmd::Agents { .. } => {

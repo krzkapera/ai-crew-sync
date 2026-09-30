@@ -44,6 +44,9 @@ struct Harness {
     servers: Vec<tokio::task::JoinHandle<()>>,
     /// The schema this harness owns, so replicas can join it.
     schema: String,
+    /// The broker this harness's servers can reach, when the test needs
+    /// one. `None` is the default installation: Postgres only.
+    nats: Option<String>,
 }
 
 impl Harness {
@@ -51,7 +54,8 @@ impl Harness {
     /// production topology: N processes, one Postgres, each with its own
     /// LISTEN connection and its own in-process event hub.
     async fn add_replica(&mut self) -> String {
-        let (base, handle) = spawn_server(self.pool.clone(), self.ct.child_token()).await;
+        let (base, handle) =
+            spawn_server(self.pool.clone(), self.ct.child_token(), self.nats.clone()).await;
         self.servers.push(handle);
         base
     }
@@ -102,6 +106,16 @@ impl Drop for Harness {
 async fn spawn_server(
     pool: PgPool,
     ct: CancellationToken,
+    nats: Option<String>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    spawn_server_with_ping(pool, ct, nats, ai_crew_sync::events::DEFAULT_PING_SECS).await
+}
+
+async fn spawn_server_with_ping(
+    pool: PgPool,
+    ct: CancellationToken,
+    nats: Option<String>,
+    event_ping_secs: u64,
 ) -> (String, tokio::task::JoinHandle<()>) {
     let app = build_router(
         pool,
@@ -114,6 +128,13 @@ async fn spawn_server(
             // than any real agent, and the limiter has its own tests.
             rate_limit_per_minute: 0,
             dashboard_secret: b"test-dashboard-secret".to_vec(),
+            nats_url: nats,
+            nats_credentials: None,
+            // The publication tests drive the outbox themselves, one step at
+            // a time, so the timing under test is the test's and not a
+            // background loop's.
+            publication_worker: false,
+            event_ping_secs,
         },
         ct.clone(),
     );
@@ -128,6 +149,23 @@ async fn spawn_server(
 }
 
 async fn setup(schema: &str) -> Option<Harness> {
+    setup_with(schema, None).await
+}
+
+/// Same, with a broker the server can reach: for the tests that route a
+/// team's conversations off Postgres.
+async fn setup_with_broker(schema: &str) -> Option<Harness> {
+    let nats = nats_url();
+    setup_with(schema, Some(nats)).await
+}
+
+async fn setup_with(schema: &str, nats: Option<String>) -> Option<Harness> {
+    // Silent unless RUST_LOG asks. A failing test that hides the server's
+    // own explanation of why it failed wastes the run.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     let url = db_url()?;
     let pool = PgPoolOptions::new()
         .max_connections(8)
@@ -160,7 +198,7 @@ async fn setup(schema: &str) -> Option<Harness> {
     MIGRATOR.run(&pool).await.expect("migrate");
 
     let ct = CancellationToken::new();
-    let (base, handle) = spawn_server(pool.clone(), ct.child_token()).await;
+    let (base, handle) = spawn_server(pool.clone(), ct.child_token(), nats.clone()).await;
 
     Some(Harness {
         pool,
@@ -168,6 +206,7 @@ async fn setup(schema: &str) -> Option<Harness> {
         ct,
         servers: vec![handle],
         schema: schema.to_owned(),
+        nats,
     })
 }
 
@@ -228,6 +267,46 @@ async fn connect_with_session(base: &str, token: &str, session: &str) -> Client 
         .serve(transport)
         .await
         .expect("mcp handshake")
+}
+
+/// Connect the way a `2026-07-28` host does: `server/discover` and
+/// per-request metadata instead of the `initialize` handshake, so every
+/// result is held to that revision's required fields.
+async fn connect_modern<T, E, A>(transport: T) -> Client
+where
+    T: rmcp::transport::IntoTransport<rmcp::RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    use rmcp::{ClientLifecycleMode, ClientServiceExt};
+    ClientConfig::default()
+        .serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+            },
+        )
+        .await
+        .expect("server/discover")
+}
+
+/// What protocol `2026-07-28` requires of a `tools/list` and a `tools/call`
+/// result, checked on a client that negotiated it (#192).
+async fn assert_mcp_2026_07_28_results(client: &Client, tools: &[&str]) {
+    let list = client.list_tools(None).await.unwrap();
+    assert_eq!(list.ttl_ms, Some(0), "the catalogue is never fresh");
+    assert_eq!(list.cache_scope, Some(rmcp::model::CacheScope::Private));
+    assert!(list.tools.iter().any(|t| t.name == "whoami"));
+    for name in tools {
+        let result = client
+            .call_tool(CallToolRequestParams::new(name.to_string()))
+            .await
+            .unwrap_or_else(|e| panic!("{name} failed: {e}"));
+        assert_eq!(
+            result.result_type,
+            Some(rmcp::model::ResultType::COMPLETE),
+            "{name}: {result:?}"
+        );
+    }
 }
 
 /// Call a tool and return its structured output.
@@ -321,6 +400,10 @@ async fn setup_rate_limited(schema: &str, per_minute: u32) -> Option<Harness> {
             max_request_bytes: 64 * 1024,
             rate_limit_per_minute: per_minute,
             dashboard_secret: b"test-dashboard-secret".to_vec(),
+            nats_url: None,
+            nats_credentials: None,
+            publication_worker: false,
+            event_ping_secs: ai_crew_sync::events::DEFAULT_PING_SECS,
         },
         child.clone(),
     );
@@ -337,6 +420,7 @@ async fn setup_rate_limited(schema: &str, per_minute: u32) -> Option<Harness> {
         ct,
         servers: vec![handle],
         schema: schema.to_owned(),
+        nats: None,
     })
 }
 
@@ -345,6 +429,26 @@ async fn setup_rate_limited(schema: &str, per_minute: u32) -> Option<Harness> {
 /// Postgres setup fails the run instead of passing zero tests.
 fn db_required() -> bool {
     std::env::var("AI_CREW_SYNC_REQUIRE_DB").is_ok_and(|v| v != "0")
+}
+
+/// Same, for the tests that need the JetStream fixture as well. Missing
+/// infrastructure fails visibly: `nats_url()` panics rather than skipping.
+macro_rules! require_db_broker {
+    ($schema:expr) => {
+        match setup_with_broker($schema).await {
+            Some(h) => h,
+            None => {
+                assert!(
+                    !db_required(),
+                    "AI_CREW_SYNC_REQUIRE_DB is set but TEST_DATABASE_URL is not: \
+                     the integration suite would have silently passed without \
+                     touching a database"
+                );
+                eprintln!("skipping: TEST_DATABASE_URL not set");
+                return;
+            }
+        }
+    };
 }
 
 macro_rules! require_db {
@@ -452,6 +556,11 @@ async fn tools_are_advertised_with_schemas() {
         "get_task",
         "heartbeat",
         "list_agents",
+        "list_sessions",
+        "register_session",
+        "resume_session",
+        "renew_session",
+        "revoke_session",
         "set_note",
         "get_note",
         "list_notes",
@@ -470,7 +579,77 @@ async fn tools_are_advertised_with_schemas() {
             tool.name
         );
     }
+
+    // A capability that is off is off in the catalogue too. Advertising
+    // eighteen tools that every call rejects is a catalogue that lies, and
+    // the model reading it spends a turn finding out.
+    let optional = [
+        "create_conversation",
+        "list_conversations",
+        "invite_to_conversation",
+        "join_conversation",
+        "leave_conversation",
+        "remove_conversation_member",
+        "archive_conversation",
+        "transfer_membership",
+        "send_conversation_message",
+        "read_conversation",
+        "get_conversation_message",
+        "ack_message",
+        "get_message_receipts",
+        "fetch_conversation_inbox",
+        "confirm_inbox_delivery",
+        "conversation_inbox_status",
+        "wait_for_conversation_updates",
+        "create_project",
+        "list_projects",
+        "grant_project_access",
+        "recover_conversation_history",
+    ];
+    for hidden in optional {
+        assert!(
+            !names.contains(&hidden),
+            "conversations are off for this team, so {hidden} must not be advertised"
+        );
+    }
+    let refused = call_expect_error(&client, "create_conversation", json!({"title": "no"})).await;
+    assert!(
+        refused.contains("not enabled"),
+        "the per-call check is still the authorization boundary: {refused}"
+    );
+
+    enable_conversations(&h.pool, "acme").await;
+    let client2 = connect(&h.base, &token).await;
+    let names2: Vec<String> = client2
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    for shown in optional {
+        assert!(
+            names2.iter().any(|n| n == shown),
+            "with the capability on, {shown} is advertised"
+        );
+    }
+    let _ = client2.cancel().await;
     let _ = client.cancel().await;
+}
+
+/// The same fields on the server's own replies, for a client that reaches
+/// `/mcp` directly on protocol `2026-07-28` (#192).
+#[tokio::test]
+async fn the_server_serves_the_fields_mcp_2026_07_28_requires() {
+    let h = require_db!("t_mcp_2026");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let mut config = StreamableHttpClientTransportConfig::with_uri(format!("{}/mcp", h.base));
+    config.auth_header = Some(token);
+    config.allow_stateless = true;
+    let client = connect_modern(StreamableHttpClientTransport::from_config(config)).await;
+    assert_mcp_2026_07_28_results(&client, &["whoami"]).await;
+    let _ = client.cancel().await;
+    h.shutdown().await;
 }
 
 #[tokio::test]
@@ -939,6 +1118,56 @@ async fn notes_are_shared_memory_with_history() {
 
     let _ = joaquin.cancel().await;
     let _ = marta.cancel().await;
+}
+
+/// A note's scope and key are names, not documents: they ride in the NOTIFY
+/// payload that Postgres caps at 8000 bytes, in every listing and on the
+/// dashboard. Unbounded, a 9 KB key failed as an opaque "database error"
+/// and a 3 KB one was stored and listed everywhere.
+#[tokio::test]
+async fn a_note_key_is_a_name_not_a_document() {
+    let h = require_db!("t_note_key");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let c = connect(&h.base, &token).await;
+
+    let err = call_expect_error(
+        &c,
+        "set_note",
+        json!({"key": "k".repeat(9000), "value": "x"}),
+    )
+    .await;
+    assert!(err.contains("note key is 9000 bytes"), "{err}");
+    assert!(err.contains("256"), "{err}");
+    assert!(!err.contains("database error"), "{err}");
+
+    let err = call_expect_error(
+        &c,
+        "set_note",
+        json!({"key": "k".repeat(300), "value": "x"}),
+    )
+    .await;
+    assert!(err.contains("note key is 300 bytes"), "{err}");
+
+    let err = call_expect_error(
+        &c,
+        "set_note",
+        json!({"scope": "s".repeat(65), "key": "fine", "value": "x"}),
+    )
+    .await;
+    assert!(err.contains("note scope is 65 bytes"), "{err}");
+    assert!(err.contains("64"), "{err}");
+
+    // The limit is the limit: a 256-byte key is a (long) name.
+    let ok = call(
+        &c,
+        "set_note",
+        json!({"scope": "s".repeat(64), "key": "k".repeat(256), "value": "x"}),
+    )
+    .await;
+    assert_eq!(ok["key"].as_str().map(str::len), Some(256), "{ok}");
+
+    let _ = c.cancel().await;
+    h.shutdown().await;
 }
 
 #[tokio::test]
@@ -1550,11 +1779,17 @@ async fn the_digest_cost_does_not_grow_with_channel_count() {
     // runs at 2.0-2.1 here — real growth, 360 rows against 12 — and a query
     // per channel at 4.2-4.3. Three sits between them with room on both
     // sides.
-    let ratio = large.as_secs_f64() / small.as_secs_f64();
+    // The bound has an absolute term as well as a ratio. Two channels can
+    // measure well under a millisecond, and the ratio of two sub-millisecond
+    // durations on a shared CI runner is mostly scheduler noise — which is
+    // how this assertion failed on runs where nothing was wrong. A query per
+    // channel costs tens of milliseconds at sixty channels, so the slack
+    // does not hide the shape it is here to catch.
+    let allowed = small.mul_f64(3.0) + std::time::Duration::from_millis(5);
     assert!(
-        ratio < 3.0,
+        large < allowed,
         "digest over 60 channels took {large:?} against {small:?} over 2 \
-         (ratio {ratio:.2}): the cost is scaling with channel count"
+         (allowed {allowed:?}): the cost is scaling with channel count"
     );
 
     let _ = client.cancel().await;
@@ -3833,6 +4068,11827 @@ async fn a_stringified_metadata_object_is_stored_as_an_object() {
     for client in [joaquin, dani] {
         let _ = client.cancel().await;
     }
+    h.shutdown().await;
+}
+
+// -------------------------------------------------- administrative credentials --
+
+/// The operator CLI path (bootstrap, agent add, token issue) through the store,
+/// exactly as `ai-crew-sync admin bootstrap` / `agent add` / `token issue` run
+/// it: credentials resolve, revocation is immediate, the two credential
+/// classes never resolve as each other, and the audit trail carries no secret.
+#[tokio::test]
+async fn administrative_credentials_are_a_separate_class_with_an_audit_trail() {
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_admin_store");
+
+    // Bootstrap: a global credential minted with no prior credential.
+    let global = store::grant_admin(&h.pool, Actor::Cli, None, Some("laptop".into()))
+        .await
+        .unwrap();
+    assert!(global.token.starts_with("acsa_"), "admin prefix");
+    assert!(global.team.is_none(), "bootstrap mints a global credential");
+    let ctx = store::resolve_admin(&h.pool, &global.token)
+        .await
+        .unwrap()
+        .expect("fresh credential resolves");
+    assert!(ctx.is_global());
+    assert_eq!(ctx.id, global.id);
+
+    // The existing operator commands keep working and mint tokens that
+    // authenticate on /mcp as exactly the requested agent and team.
+    let team = store::create_team(&h.pool, Actor::Cli, "acme", Some("Acme".into()))
+        .await
+        .unwrap();
+    let again = store::create_team(&h.pool, Actor::Cli, "ACME", None)
+        .await
+        .unwrap();
+    assert_eq!(again.id, team.id, "create is idempotent on the slug");
+    assert_eq!(again.name, "Acme", "a repeat never renames");
+    store::create_agent(&h.pool, Actor::Cli, team.id, "Backend", None)
+        .await
+        .unwrap();
+    // A repeat on an active agent is a no-op and logs nothing; a disable and
+    // a re-create are real transitions and log one row each.
+    store::create_agent(
+        &h.pool,
+        Actor::Cli,
+        team.id,
+        "backend",
+        Some("Backend".into()),
+    )
+    .await
+    .unwrap();
+    store::disable_agent(&h.pool, Actor::Cli, team.id, "backend")
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, team.id, "backend", None)
+        .await
+        .unwrap();
+    assert!(
+        store::create_team(&h.pool, Actor::Cli, "evil", Some("Acme\x1b[31m".into()))
+            .await
+            .is_err(),
+        "a team name is display text: no control characters"
+    );
+    let issued = store::issue_token(
+        &h.pool,
+        Actor::Cli,
+        team.id,
+        "backend",
+        Some("sesion backend".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (issued.agent.as_str(), issued.team.as_str()),
+        ("backend", "acme")
+    );
+    let client = connect(&h.base, &issued.token).await;
+    let me = call(&client, "whoami", json!({})).await;
+    assert_eq!(me["agent"], "backend");
+    assert_eq!(me["team"], "acme");
+    let _ = client.cancel().await;
+
+    // A team credential lists only its team; the global listing sees both.
+    let team_admin = store::grant_admin(&h.pool, Actor::Admin(global.id), Some(team.id), None)
+        .await
+        .unwrap();
+    assert_eq!(team_admin.team.as_deref(), Some("acme"));
+    let mine = store::list_admins(&h.pool, Some(team.id)).await.unwrap();
+    assert_eq!(
+        mine.iter().map(|c| c.id).collect::<Vec<_>>(),
+        vec![team_admin.id]
+    );
+    assert_eq!(store::list_admins(&h.pool, None).await.unwrap().len(), 2);
+
+    // Neither class resolves as the other: same hashing, different tables.
+    assert!(
+        store::resolve_admin(&h.pool, &issued.token)
+            .await
+            .unwrap()
+            .is_none(),
+        "an agent token is not an administrative credential"
+    );
+    assert!(
+        ai_crew_sync::auth::resolve_token(&h.pool, &global.token)
+            .await
+            .is_err(),
+        "an administrative credential is not an agent token"
+    );
+
+    // Scoped revocation: a team scope cannot reach a global credential or a
+    // token from another team, and reports them as not found.
+    let other = store::create_team(&h.pool, Actor::Cli, "other", None)
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, other.id, "x", None)
+        .await
+        .unwrap();
+    let foreign = store::issue_token(&h.pool, Actor::Cli, other.id, "x", None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store::revoke_token(
+            &h.pool,
+            Actor::Admin(team_admin.id),
+            Some(team.id),
+            foreign.id
+        )
+        .await,
+        Err(ai_crew_sync::error::BusError::NotFound(_))
+    ));
+    assert!(matches!(
+        store::revoke_admin(
+            &h.pool,
+            Actor::Admin(team_admin.id),
+            Some(team.id),
+            global.id
+        )
+        .await,
+        Err(ai_crew_sync::error::BusError::NotFound(_))
+    ));
+    assert!(
+        store::resolve_admin(&h.pool, &global.token)
+            .await
+            .unwrap()
+            .is_some(),
+        "a failed scoped revoke changes nothing"
+    );
+
+    // Revocation is immediate for both classes, and idempotent.
+    store::revoke_token(
+        &h.pool,
+        Actor::Admin(team_admin.id),
+        Some(team.id),
+        issued.id,
+    )
+    .await
+    .unwrap();
+    store::revoke_token(
+        &h.pool,
+        Actor::Admin(team_admin.id),
+        Some(team.id),
+        issued.id,
+    )
+    .await
+    .unwrap();
+    assert!(
+        ai_crew_sync::auth::resolve_token(&h.pool, &issued.token)
+            .await
+            .is_err()
+    );
+    store::revoke_admin(&h.pool, Actor::Cli, None, global.id)
+        .await
+        .unwrap();
+    assert!(
+        store::resolve_admin(&h.pool, &global.token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Audit: every mutation logged with its actor, and no secret anywhere.
+    let rows: Vec<(String, Option<Uuid>, String, Value)> = sqlx::query_as(
+        "SELECT actor_source, actor_admin_id, action, detail FROM admin_audit ORDER BY id",
+    )
+    .fetch_all(&h.pool)
+    .await
+    .unwrap();
+    let actions: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+    assert_eq!(
+        actions,
+        vec![
+            "admin.grant",
+            "team.create",
+            "agent.create",
+            "agent.disable",
+            "agent.enable",
+            "token.issue",
+            "admin.grant",
+            "team.create",
+            "agent.create",
+            "token.issue",
+            "token.revoke",
+            "admin.revoke",
+        ],
+        "one row per real transition, none for the idempotent repeats"
+    );
+    let by_http: Vec<&(String, Option<Uuid>, String, Value)> =
+        rows.iter().filter(|r| r.0 == "http").collect();
+    assert_eq!(by_http.len(), 2, "the two actions taken with a credential");
+    assert!(
+        by_http.iter().all(|r| r.1.is_some()),
+        "http rows name their credential"
+    );
+    assert!(rows.iter().filter(|r| r.0 == "cli").all(|r| r.1.is_none()));
+    let dump = serde_json::to_string(&rows.iter().map(|r| &r.3).collect::<Vec<_>>()).unwrap();
+    for secret in [
+        &global.token,
+        &team_admin.token,
+        &issued.token,
+        &foreign.token,
+    ] {
+        assert!(
+            !dump.contains(secret.as_str()),
+            "audit detail carries a secret"
+        );
+        assert!(
+            !dump.contains(&secret[5..]),
+            "audit detail carries a secret's body"
+        );
+    }
+    assert!(
+        dump.contains(&issued.prefix),
+        "the display prefix is what the log keeps"
+    );
+
+    h.shutdown().await;
+}
+
+/// Revocation is one transition however many callers race for it: the
+/// UPDATE is conditional on the row being active, so exactly one caller
+/// performs it and exactly one audit row is written; the others succeed as
+/// no-ops.
+#[tokio::test]
+async fn concurrent_revocations_produce_one_transition_and_one_audit_row() {
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_admin_revoke_race");
+    let team = store::create_team(&h.pool, Actor::Cli, "acme", None)
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, team.id, "bot", None)
+        .await
+        .unwrap();
+    let issued = store::issue_token(&h.pool, Actor::Cli, team.id, "bot", None)
+        .await
+        .unwrap();
+    let admin = store::grant_admin(&h.pool, Actor::Cli, Some(team.id), None)
+        .await
+        .unwrap();
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let pool = h.pool.clone();
+        let (tid, token_id, admin_id) = (team.id, issued.id, admin.id);
+        tasks.push(tokio::spawn(async move {
+            let a = store::revoke_token(&pool, Actor::Admin(admin_id), Some(tid), token_id).await;
+            let b = store::revoke_admin(&pool, Actor::Admin(admin_id), Some(tid), admin_id).await;
+            (a.is_ok(), b.is_ok())
+        }));
+    }
+    for t in tasks {
+        assert_eq!(t.await.unwrap(), (true, true), "every racer succeeds");
+    }
+    let (revokes,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM admin_audit WHERE action IN ('token.revoke', 'admin.revoke')",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(revokes, 2, "one row per transition, not per caller");
+
+    h.shutdown().await;
+}
+
+// ------------------------------------------------------- /admin HTTP surface --
+
+/// Minimal client for `/admin/*`: a bearer, a method, a path, a JSON body.
+struct Admin {
+    http: reqwest::Client,
+    base: String,
+    token: String,
+}
+
+impl Admin {
+    fn new(base: &str, token: &str) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base: base.to_owned(),
+            token: token.to_owned(),
+        }
+    }
+
+    async fn req(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> (u16, Value) {
+        let mut r = self
+            .http
+            .request(method, format!("{}/admin{path}", self.base))
+            .header("Authorization", format!("Bearer {}", self.token));
+        if let Some(body) = body {
+            r = r.json(&body);
+        }
+        let resp = r.send().await.unwrap();
+        let status = resp.status().as_u16();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    async fn get(&self, path: &str) -> (u16, Value) {
+        self.req(reqwest::Method::GET, path, None).await
+    }
+    async fn post(&self, path: &str, body: Value) -> (u16, Value) {
+        self.req(reqwest::Method::POST, path, Some(body)).await
+    }
+    async fn delete(&self, path: &str) -> (u16, Value) {
+        self.req(reqwest::Method::DELETE, path, None).await
+    }
+}
+
+/// A raw `tools/list` on `/mcp` with a bearer, for status checks only.
+async fn mcp_status(base: &str, token: &str) -> u16 {
+    reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+#[tokio::test]
+async fn admin_api_refuses_everything_but_an_administrative_credential() {
+    let h = require_db!("t_admin_auth");
+    let agent_token = seed_agent(&h.pool, "acme", "joaquin").await;
+
+    // No bearer at all.
+    let (status, body) = Admin::new(&h.base, "").get("/whoami").await;
+    assert_eq!(status, 401);
+    assert!(
+        body["error"].as_str().unwrap().contains("bootstrap"),
+        "{body}"
+    );
+
+    // An agent token: refused, and told what to use instead.
+    let (status, body) = Admin::new(&h.base, &agent_token).get("/whoami").await;
+    assert_eq!(status, 401, "an agent token never administers");
+    assert!(
+        body["error"].as_str().unwrap().contains("agent token"),
+        "{body}"
+    );
+    // ...on every route, including the ones that mint.
+    let agent = Admin::new(&h.base, &agent_token);
+    assert_eq!(
+        agent
+            .post("/teams/acme/tokens", json!({"agent": "joaquin"}))
+            .await
+            .0,
+        401,
+        "an agent token cannot mint a token, not even for its own agent"
+    );
+    assert_eq!(agent.post("/credentials", json!({})).await.0, 401);
+
+    // A well-formed but unknown credential.
+    let (status, _) = Admin::new(&h.base, "acsa_deadbeef").get("/whoami").await;
+    assert_eq!(status, 401);
+
+    // And an administrative credential is not an agent token on /mcp.
+    let global = ai_crew_sync::store::admin::grant_admin(
+        &h.pool,
+        ai_crew_sync::store::admin::Actor::Cli,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(mcp_status(&h.base, &global.token).await, 401);
+    let (status, body) = Admin::new(&h.base, &global.token).get("/whoami").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["scope"], "global");
+    assert!(body["team"].is_null());
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_api_global_credential_runs_the_whole_onboarding_remotely() {
+    let h = require_db!("t_admin_global");
+    let bootstrap = ai_crew_sync::store::admin::grant_admin(
+        &h.pool,
+        ai_crew_sync::store::admin::Actor::Cli,
+        None,
+        Some("laptop".into()),
+    )
+    .await
+    .unwrap();
+    let admin = Admin::new(&h.base, &bootstrap.token);
+
+    let (status, body) = admin
+        .post("/teams", json!({"slug": "RoundCrew", "name": "RoundCrew"}))
+        .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["team"]["slug"], "roundcrew", "slugs are normalised");
+
+    let (status, body) = admin
+        .post(
+            "/teams/roundcrew/agents",
+            json!({"name": "backend", "display_name": "RoundCrew backend"}),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["agent"]["name"], "backend");
+
+    let (status, body) = admin
+        .post(
+            "/teams/roundcrew/tokens",
+            json!({"agent": "backend", "label": "sesion backend"}),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let token = body["token"]["token"].as_str().unwrap().to_owned();
+    let token_id = body["token"]["id"].as_str().unwrap().to_owned();
+    assert!(token.starts_with("acs_"));
+    assert_eq!(body["token"]["agent"], "backend");
+    assert_eq!(body["token"]["team"], "roundcrew");
+    assert_eq!(body["token"]["label"], "sesion backend");
+
+    // The property that matters: the token IS that agent in that team on /mcp.
+    let client = connect(&h.base, &token).await;
+    let me = call(&client, "whoami", json!({})).await;
+    assert_eq!(me["agent"], "backend");
+    assert_eq!(me["team"], "roundcrew");
+    let _ = client.cancel().await;
+
+    // Listings show it without the secret.
+    let (_, body) = admin.get("/teams/roundcrew/tokens").await;
+    let listed = &body["tokens"][0];
+    assert_eq!(listed["id"], token_id);
+    assert!(
+        listed.get("token").is_none(),
+        "a listing never carries a secret"
+    );
+    assert_eq!(listed["prefix"], &token[..12]);
+    let (_, body) = admin.get("/teams").await;
+    assert_eq!(body["teams"][0]["agents"], 1);
+
+    // Unknown things are 404 with a hint, bad input 400.
+    assert_eq!(
+        admin
+            .post("/teams/nope/agents", json!({"name": "x"}))
+            .await
+            .0,
+        404
+    );
+    assert_eq!(
+        admin
+            .post("/teams/roundcrew/tokens", json!({"agent": "ghost"}))
+            .await
+            .0,
+        404
+    );
+    let (status, body) = admin
+        .post("/teams/roundcrew/agents", json!({"name": "has space"}))
+        .await;
+    assert_eq!(status, 400, "{body}");
+    // Extractor rejections wear the same JSON shape as every other error.
+    let resp = reqwest::Client::new()
+        .post(format!("{}/admin/teams/roundcrew/agents", h.base))
+        .header("Authorization", format!("Bearer {}", bootstrap.token))
+        .header("Content-Type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.expect("a JSON error body");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid JSON body"),
+        "{body}"
+    );
+    let (status, body) = admin.delete("/teams/roundcrew/tokens/not-a-uuid").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("path parameter"),
+        "{body}"
+    );
+    let (status, body) = admin.post("/credentials", json!({"team": ""})).await;
+    assert_eq!(
+        status, 400,
+        "an empty team is a mistake, not a global grant: {body}"
+    );
+
+    // Revocation stops the token on /mcp immediately.
+    let (status, _) = admin
+        .delete(&format!("/teams/roundcrew/tokens/{token_id}"))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(mcp_status(&h.base, &token).await, 401);
+
+    // Granting: a team credential, then a second global one; each works on
+    // /admin/whoami with the right scope, and revoking cuts it off.
+    let (status, body) = admin
+        .post(
+            "/credentials",
+            json!({"team": "roundcrew", "label": "dani"}),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let team_cred = body["credential"]["token"].as_str().unwrap().to_owned();
+    let team_cred_id = body["credential"]["id"].as_str().unwrap().to_owned();
+    assert!(team_cred.starts_with("acsa_"));
+    let (_, body) = Admin::new(&h.base, &team_cred).get("/whoami").await;
+    assert_eq!(body["scope"], "team");
+    assert_eq!(body["team"], "roundcrew");
+
+    let (status, body) = admin.post("/credentials", json!({})).await;
+    assert_eq!(status, 201, "{body}");
+    assert!(body["credential"]["team"].is_null(), "no team means global");
+
+    let (_, body) = admin.get("/credentials").await;
+    assert_eq!(body["credentials"].as_array().unwrap().len(), 3);
+    assert!(
+        body["credentials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c.get("token").is_none()),
+        "listings never carry a secret"
+    );
+
+    let (status, _) = admin.delete(&format!("/credentials/{team_cred_id}")).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        Admin::new(&h.base, &team_cred).get("/whoami").await.0,
+        401,
+        "a revoked credential stops authorising at once"
+    );
+
+    // Audit: http rows name the credential that acted, and hold no secret.
+    let rows: Vec<(String, Option<Uuid>, String, Value)> = sqlx::query_as(
+        "SELECT actor_source, actor_admin_id, action, detail FROM admin_audit
+         WHERE actor_source = 'http' ORDER BY id",
+    )
+    .fetch_all(&h.pool)
+    .await
+    .unwrap();
+    let actions: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+    assert_eq!(
+        actions,
+        vec![
+            "team.create",
+            "agent.create",
+            "token.issue",
+            "token.revoke",
+            "admin.grant",
+            "admin.grant",
+            "admin.revoke",
+        ]
+    );
+    assert!(rows.iter().all(|r| r.1 == Some(bootstrap.id)));
+    let dump = serde_json::to_string(&rows.iter().map(|r| &r.3).collect::<Vec<_>>()).unwrap();
+    assert!(!dump.contains(&token[5..]));
+    assert!(!dump.contains(&team_cred[5..]));
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_api_team_credential_cannot_leave_its_team_by_any_route() {
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_admin_team");
+    let acme = store::create_team(&h.pool, Actor::Cli, "acme", None)
+        .await
+        .unwrap();
+    let other = store::create_team(&h.pool, Actor::Cli, "other", None)
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, acme.id, "joaquin", None)
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, other.id, "marta", None)
+        .await
+        .unwrap();
+    let foreign = store::issue_token(&h.pool, Actor::Cli, other.id, "marta", None)
+        .await
+        .unwrap();
+    let global = store::grant_admin(&h.pool, Actor::Cli, None, None)
+        .await
+        .unwrap();
+    let scoped = store::grant_admin(&h.pool, Actor::Cli, Some(acme.id), None)
+        .await
+        .unwrap();
+    let dani = Admin::new(&h.base, &scoped.token);
+
+    // Inside its team: everything a global credential can do there.
+    let (status, body) = dani
+        .post("/teams/acme/agents", json!({"name": "dani-codex"}))
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = dani
+        .post(
+            "/teams/acme/tokens",
+            json!({"agent": "dani-codex", "label": "x"}),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let mine = body["token"]["token"].as_str().unwrap().to_owned();
+    let mine_id = body["token"]["id"].as_str().unwrap().to_owned();
+    let client = connect(&h.base, &mine).await;
+    let me = call(&client, "whoami", json!({})).await;
+    assert_eq!(
+        (me["agent"].as_str(), me["team"].as_str()),
+        (Some("dani-codex"), Some("acme"))
+    );
+    let _ = client.cancel().await;
+
+    // By slug: another team is forbidden, existing or not, same answer.
+    for path in [
+        "/teams/other/agents",
+        "/teams/other/tokens",
+        "/teams/nope/tokens",
+    ] {
+        let (status, body) = dani.get(path).await;
+        assert_eq!(status, 403, "{path}: {body}");
+        assert!(body["error"].as_str().unwrap().contains("'acme'"), "{body}");
+    }
+    assert_eq!(
+        dani.post("/teams/other/tokens", json!({"agent": "marta"}))
+            .await
+            .0,
+        403
+    );
+    // By UUID: a foreign token under its own team's path is simply not found.
+    let (status, _) = dani
+        .delete(&format!("/teams/acme/tokens/{}", foreign.id))
+        .await;
+    assert_eq!(status, 404);
+    assert_eq!(
+        mcp_status(&h.base, &foreign.token).await,
+        200,
+        "and untouched"
+    );
+    // Nor can a global credential revoke it through the wrong team's path.
+    let (status, _) = Admin::new(&h.base, &global.token)
+        .delete(&format!("/teams/acme/tokens/{}", foreign.id))
+        .await;
+    assert_eq!(status, 404);
+
+    // Global-only actions: create teams, grant credentials.
+    let (status, body) = dani.post("/teams", json!({"slug": "mine"})).await;
+    assert_eq!(status, 403, "{body}");
+    let (status, body) = dani.post("/credentials", json!({"team": "acme"})).await;
+    assert_eq!(status, 403, "{body}");
+    let (status, _) = dani.post("/credentials", json!({})).await;
+    assert_eq!(status, 403, "nor a global one");
+    assert_eq!(
+        store::list_admins(&h.pool, None).await.unwrap().len(),
+        2,
+        "nothing was granted"
+    );
+
+    // The team roster it sees is exactly its own team.
+    let (_, body) = dani.get("/teams").await;
+    assert_eq!(body["teams"].as_array().unwrap().len(), 1);
+    assert_eq!(body["teams"][0]["slug"], "acme");
+    let (_, body) = dani.get("/credentials").await;
+    assert_eq!(body["credentials"].as_array().unwrap().len(), 1);
+    assert_eq!(body["credentials"][0]["id"], scoped.id.to_string());
+
+    // It cannot revoke the global credential, and can revoke its own team's
+    // tokens and — last — itself.
+    let (status, _) = dani.delete(&format!("/credentials/{}", global.id)).await;
+    assert_eq!(status, 404);
+    assert_eq!(
+        Admin::new(&h.base, &global.token).get("/whoami").await.0,
+        200
+    );
+    assert_eq!(
+        dani.delete(&format!("/teams/acme/tokens/{mine_id}"))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(mcp_status(&h.base, &mine).await, 401);
+    assert_eq!(
+        dani.delete(&format!("/credentials/{}", scoped.id)).await.0,
+        200
+    );
+    assert_eq!(dani.get("/whoami").await.0, 401);
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_api_caps_active_tokens_per_agent() {
+    use ai_crew_sync::store::admin::{self as store, Actor, MAX_ACTIVE_TOKENS_PER_AGENT};
+
+    let h = require_db!("t_admin_cap");
+    let acme = store::create_team(&h.pool, Actor::Cli, "acme", None)
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, acme.id, "bot", None)
+        .await
+        .unwrap();
+    for _ in 0..MAX_ACTIVE_TOKENS_PER_AGENT {
+        store::issue_token(&h.pool, Actor::Cli, acme.id, "bot", None)
+            .await
+            .unwrap();
+    }
+    let global = store::grant_admin(&h.pool, Actor::Cli, None, None)
+        .await
+        .unwrap();
+    let admin = Admin::new(&h.base, &global.token);
+    let (status, body) = admin
+        .post("/teams/acme/tokens", json!({"agent": "bot"}))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("Revoke"), "{body}");
+
+    // Revoking one frees a slot.
+    let (_, body) = admin.get("/teams/acme/tokens").await;
+    let some_id = body["tokens"][0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        admin
+            .delete(&format!("/teams/acme/tokens/{some_id}"))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        admin
+            .post("/teams/acme/tokens", json!({"agent": "bot"}))
+            .await
+            .0,
+        201
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_api_has_its_own_lower_rate_limit() {
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    // 200/min on MCP means 20/min on /admin, with a burst of 10.
+    let Some(h) = setup_rate_limited("t_admin_rl", 200).await else {
+        assert!(!db_required());
+        return;
+    };
+    let global = store::grant_admin(&h.pool, Actor::Cli, None, None)
+        .await
+        .unwrap();
+    let admin = Admin::new(&h.base, &global.token);
+    let mut throttled = None;
+    for _ in 0..30 {
+        let (status, body) = admin.get("/whoami").await;
+        if status == 429 {
+            throttled = Some(body);
+            break;
+        }
+    }
+    let body = throttled.expect("the admin bucket must run out well before the MCP one would");
+    assert!(
+        body["error"].as_str().unwrap().contains("retry in"),
+        "{body}"
+    );
+
+    h.shutdown().await;
+}
+
+// ------------------------------------------------------- admin remote CLI --
+
+/// The remote CLI's library functions against the real server and a
+/// temporary configuration directory: the full onboarding flow with
+/// verification and `--save`, and the failure paths that must leave no
+/// trace.
+#[tokio::test]
+async fn admin_cli_runs_the_remote_flow_end_to_end() {
+    use ai_crew_sync::admin_cli::{self, SaveTarget};
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_admin_cli");
+    let dir = std::env::temp_dir().join(format!("acs-admin-cli-{}", Uuid::new_v4()));
+    let bootstrap = store::grant_admin(&h.pool, Actor::Cli, None, None)
+        .await
+        .unwrap();
+
+    // A bad credential is refused and nothing is written.
+    let err = admin_cli::login(&dir, &h.base, "acsa_nope".into())
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("nothing was saved"), "{err:#}");
+    assert!(!dir.join("admin").exists());
+
+    // Login verifies, then persists with 0600; the URL is normalised.
+    let (me, path) = admin_cli::login(&dir, &format!("{}/mcp", h.base), bootstrap.token.clone())
+        .await
+        .unwrap();
+    assert_eq!(me["scope"], "global");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains(&format!("url={}\n", h.base)), "{text}");
+    assert!(text.contains(&format!("token={}\n", bootstrap.token)));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let cfg = admin_cli::load_config(&dir).unwrap();
+    assert_eq!(cfg.url, h.base);
+    let api = admin_cli::Api::new(cfg);
+
+    // Team, agent, token — and the token is verified before anything else.
+    api.create_team("roundcrew", Some("RoundCrew"))
+        .await
+        .unwrap();
+    api.create_agent("roundcrew", "backend", None)
+        .await
+        .unwrap();
+
+    // The file already has hand-written entries that must survive.
+    let tokens = admin_cli::tokens_file(&dir, "roundcrew");
+    std::fs::write(
+        &tokens,
+        "# roundcrew tokens\n_base=acs_base_keep\nweb=acs_web_keep\n",
+    )
+    .unwrap();
+    let issued = api
+        .issue_token("roundcrew", "backend", Some("sesion backend"))
+        .await
+        .unwrap();
+    let saved = admin_cli::finish_issue(
+        &api,
+        &issued,
+        "backend",
+        "roundcrew",
+        Some(&SaveTarget {
+            dir: dir.clone(),
+            repo: "backend".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.as_deref(), Some(tokens.as_path()));
+    let text = std::fs::read_to_string(&tokens).unwrap();
+    assert_eq!(
+        text,
+        format!(
+            "# roundcrew tokens\n_base=acs_base_keep\nweb=acs_web_keep\nbackend={}\n",
+            issued.token
+        ),
+        "only the backend= line is added; _base and the rest are untouched"
+    );
+    // The saved token is that agent on /mcp.
+    let client = connect(&h.base, &issued.token).await;
+    let me = call(&client, "whoami", json!({})).await;
+    assert_eq!(
+        (me["agent"].as_str(), me["team"].as_str()),
+        (Some("backend"), Some("roundcrew"))
+    );
+    let _ = client.cancel().await;
+
+    // Re-issuing for the same repo replaces the line and does NOT revoke the
+    // previous token.
+    let second = api.issue_token("roundcrew", "backend", None).await.unwrap();
+    admin_cli::finish_issue(
+        &api,
+        &second,
+        "backend",
+        "roundcrew",
+        Some(&SaveTarget {
+            dir: dir.clone(),
+            repo: "backend".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&tokens).unwrap();
+    assert!(text.contains(&format!("backend={}\n", second.token)));
+    assert!(!text.contains(&issued.token), "one line per repo");
+    assert!(text.starts_with("# roundcrew tokens\n_base=acs_base_keep\n"));
+    assert_eq!(
+        mcp_status(&h.base, &issued.token).await,
+        200,
+        "the old token still works"
+    );
+
+    // Verification failure: a token that authenticates as someone else is
+    // revoked, and the file is left exactly as it was.
+    api.create_agent("roundcrew", "web", None).await.unwrap();
+    let other = api.issue_token("roundcrew", "web", None).await.unwrap();
+    let before = std::fs::read_to_string(&tokens).unwrap();
+    let err = admin_cli::finish_issue(
+        &api,
+        &other,
+        "backend",
+        "roundcrew",
+        Some(&SaveTarget {
+            dir: dir.clone(),
+            repo: "backend".into(),
+        }),
+    )
+    .await
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("web@roundcrew, not backend@roundcrew"),
+        "{msg}"
+    );
+    assert!(msg.contains("has been revoked"), "{msg}");
+    assert_eq!(
+        std::fs::read_to_string(&tokens).unwrap(),
+        before,
+        "file untouched"
+    );
+    assert_eq!(
+        mcp_status(&h.base, &other.token).await,
+        401,
+        "the mismatched token is dead"
+    );
+
+    // A save that cannot be written revokes the verified token too: a token
+    // that was never printed and never saved must not stay active.
+    let unwritable = dir.join("blocked");
+    std::fs::write(&unwritable, "not a directory").unwrap();
+    let doomed = api.issue_token("roundcrew", "backend", None).await.unwrap();
+    let err = admin_cli::finish_issue(
+        &api,
+        &doomed,
+        "backend",
+        "roundcrew",
+        Some(&SaveTarget {
+            dir: unwritable.clone(),
+            repo: "backend".into(),
+        }),
+    )
+    .await
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("could not be saved"), "{msg}");
+    assert!(msg.contains("has been revoked"), "{msg}");
+    assert_eq!(mcp_status(&h.base, &doomed.token).await, 401);
+
+    // Revoke through the CLI stops the token on /mcp.
+    api.revoke_token("roundcrew", second.id).await.unwrap();
+    assert_eq!(mcp_status(&h.base, &second.token).await, 401);
+
+    // A team credential logged in on this machine is confined to its team.
+    let team_dir = dir.join("dani");
+    let granted = api
+        .grant_credential(Some("roundcrew"), Some("dani"))
+        .await
+        .unwrap();
+    let team_token = granted["credential"]["token"].as_str().unwrap().to_owned();
+    let (me, _) = admin_cli::login(&team_dir, &h.base, team_token)
+        .await
+        .unwrap();
+    assert_eq!(me["team"], "roundcrew");
+    let dani = admin_cli::Api::new(admin_cli::load_config(&team_dir).unwrap());
+    dani.create_agent("roundcrew", "docs", None).await.unwrap();
+    let err = dani.create_agent("other", "docs", None).await.unwrap_err();
+    assert!(err.to_string().contains("403"), "{err}");
+    assert!(err.to_string().contains("'roundcrew'"), "{err}");
+    let err = dani.create_team("mine", None).await.unwrap_err();
+    assert!(err.to_string().contains("403"), "{err}");
+
+    // Logout forgets the file and nothing else.
+    assert!(admin_cli::remove_config(&team_dir).unwrap());
+    assert!(!admin_cli::remove_config(&team_dir).unwrap());
+    assert!(admin_cli::load_config(&team_dir).is_err());
+    assert!(tokens.exists(), "token files are not login state");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+// ------------------------------------------------------------ local context --
+
+/// The resolver against a real bus: a profile plus a token file yields a
+/// verified identity with no BUS_TOKEN anywhere; the wrong token behind the
+/// right profile, and a revoked one, are refused with a reason.
+#[tokio::test]
+async fn local_profiles_resolve_and_verify_against_the_bus() {
+    use ai_crew_sync::context::{self, Inputs, Profile, Profiles, Source};
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_context");
+    let dir = std::env::temp_dir().join(format!("acs-context-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let acme = store::create_team(&h.pool, Actor::Cli, "acme", None)
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, acme.id, "joaquin", None)
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, acme.id, "marta", None)
+        .await
+        .unwrap();
+    let mine = store::issue_token(&h.pool, Actor::Cli, acme.id, "joaquin", None)
+        .await
+        .unwrap();
+    let hers = store::issue_token(&h.pool, Actor::Cli, acme.id, "marta", None)
+        .await
+        .unwrap();
+
+    context::save_profiles(
+        &dir,
+        &Profiles {
+            default: None,
+            profiles: std::collections::BTreeMap::from([(
+                "acme".to_owned(),
+                Profile {
+                    url: h.base.clone(),
+                    team: "acme".into(),
+                    agent: "joaquin".into(),
+                    tokens: "tokens-acme".into(),
+                    key: None,
+                },
+            )]),
+        },
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("tokens-acme"),
+        format!("_base={}\nstolen={}\n", mine.token, hers.token),
+    )
+    .unwrap();
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(context::PROJECT_FILE),
+        "profile = \"acme\"\nproject = \"api\"\nchannel = \"api\"\n",
+    )
+    .unwrap();
+
+    // Two windows in the same repository, no environment: both resolve the
+    // project's profile, and each may pick a different entry without
+    // touching the file the other reads.
+    let base = Inputs {
+        config_dir: dir.clone(),
+        project_dir: Some(repo.clone()),
+        ..Default::default()
+    };
+    let r = context::resolve(&base).unwrap();
+    assert_eq!(r.source, Source::ProjectDefault);
+    assert_eq!(
+        r.token_key.as_deref(),
+        Some("_base"),
+        "no 'api' entry, so _base"
+    );
+    assert_eq!(r.project.as_deref(), Some("api"));
+    let v = context::verify(&r).await.unwrap();
+    assert_eq!((v.agent.as_str(), v.team.as_str()), ("joaquin", "acme"));
+
+    // The right profile over someone else's token: refused, with the entry
+    // named, and the project file untouched.
+    let before = std::fs::read_to_string(repo.join(context::PROJECT_FILE)).unwrap();
+    std::fs::write(
+        repo.join(context::PROJECT_FILE),
+        "profile = \"acme\"\nproject = \"api\"\nkey = \"stolen\"\n",
+    )
+    .unwrap();
+    let r = context::resolve(&base).unwrap();
+    assert_eq!(r.token_key.as_deref(), Some("stolen"));
+    let err = format!("{:#}", context::verify(&r).await.unwrap_err());
+    assert!(err.contains("expects joaquin@acme"), "{err}");
+    assert!(err.contains("marta@acme"), "{err}");
+    assert!(err.contains("'stolen'"), "{err}");
+    std::fs::write(repo.join(context::PROJECT_FILE), before).unwrap();
+
+    // A revoked token is reported as such, pointing at the entry to replace.
+    store::revoke_token(&h.pool, Actor::Cli, None, mine.id)
+        .await
+        .unwrap();
+    let r = context::resolve(&base).unwrap();
+    let err = format!("{:#}", context::verify(&r).await.unwrap_err());
+    assert!(err.contains("did not accept the token"), "{err}");
+    assert!(err.contains("'_base'"), "{err}");
+    assert!(err.contains("admin token issue"), "{err}");
+
+    // Explicit credentials still work exactly as before, and are not
+    // checked against any profile.
+    let fresh = store::issue_token(&h.pool, Actor::Cli, acme.id, "marta", None)
+        .await
+        .unwrap();
+    let explicit = Inputs {
+        explicit_url: Some(format!("{}/mcp", h.base)),
+        explicit_token: Some(fresh.token.clone()),
+        ..base.clone()
+    };
+    let r = context::resolve(&explicit).unwrap();
+    assert_eq!(r.source, Source::Explicit);
+    assert!(r.expected.is_none());
+    let v = context::verify(&r).await.unwrap();
+    assert_eq!(v.agent, "marta");
+
+    // The project's channel is not decoration: a message with neither
+    // --channel nor --to goes there.
+    let defaults = ai_crew_sync::client::mapping::Defaults {
+        channel: r.channel.clone(),
+    };
+    let (tool, args) = ai_crew_sync::client::mapping::to_call_with(
+        &ai_crew_sync::client::ClientCmd::Send {
+            channel: None,
+            to: None,
+            body: "from the project".into(),
+            announce: false,
+            reply_to: None,
+            file: vec![],
+        },
+        &defaults,
+    )
+    .unwrap()
+    .expect("send maps to a tool");
+    assert_eq!(tool, "post_message");
+    assert_eq!(args["channel"], "api", "the .acs.toml channel is used");
+    // A direct message stays direct, and an explicit channel still wins.
+    let (_, args) = ai_crew_sync::client::mapping::to_call_with(
+        &ai_crew_sync::client::ClientCmd::Send {
+            channel: None,
+            to: Some("marta".into()),
+            body: "hi".into(),
+            announce: false,
+            reply_to: None,
+            file: vec![],
+        },
+        &defaults,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(args["channel"].is_null(), "a DM is not redirected: {args}");
+
+    // The secret never appears in the redacted view.
+    let shown = serde_json::to_string(&r.redacted()).unwrap();
+    assert!(!shown.contains(&fresh.token[5..]));
+    assert!(shown.contains(&fresh.token[..12]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+// -------------------------------------------------------- session discovery --
+
+/// Five windows on one token and one repository — implementation, design, a
+/// Claude reviewer and two Codex reviewers — are discoverable separately by
+/// project and role, keep distinct addresses even when they share both, and
+/// a message to one of them reaches that one alone.
+#[tokio::test]
+async fn sessions_are_discoverable_by_project_and_role_and_addressed_exactly() {
+    let h = require_db!("t_sessions");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    let outsider = seed_agent(&h.pool, "other", "eve").await;
+
+    // Opaque session ids, the way a per-conversation proxy would mint them.
+    let windows = [
+        ("s-1a2b3c4d", "market-data", "implementation"),
+        ("s-5e6f7a8b", "market-data", "design"),
+        ("s-9c0d1e2f", "market-data", "review"),
+        ("s-3a4b5c6d", "market-data", "review"),
+        ("s-7e8f9a0b", "market-data", "review"),
+    ];
+    let mut clients = Vec::new();
+    for (session, project, role) in windows {
+        let c = connect_with_session(&h.base, &token, session).await;
+        let beat = call(
+            &c,
+            "heartbeat",
+            json!({"project": project, "role": role, "repo": "acme/market-data",
+                   "activity": format!("{role} window")}),
+        )
+        .await;
+        assert_eq!(beat["project"], project);
+        assert_eq!(beat["role"], role);
+        clients.push(c);
+    }
+    // A labelled window of another person on another project, and one with
+    // an already expired lease.
+    let dani = connect_with_session(&h.base, &dani_token, "s-dani0001").await;
+    call(
+        &dani,
+        "heartbeat",
+        json!({"project": "core-manager", "role": "implementation"}),
+    )
+    .await;
+    let stale = connect_with_session(&h.base, &token, "s-stale001").await;
+    call(
+        &stale,
+        "heartbeat",
+        json!({"project": "market-data", "role": "review"}),
+    )
+    .await;
+    sqlx::query("UPDATE agent_presence SET expires_at = now() - interval '1 minute' WHERE session = 's-stale001'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    // Labels are validated as labels, not descriptions.
+    let err = call_expect_error(&clients[0], "heartbeat", json!({"role": "code review!"})).await;
+    assert!(err.contains("role"), "{err}");
+
+    // Discovery: by project, by role, by both; every window separately.
+    let all = call(
+        &clients[0],
+        "list_sessions",
+        json!({"project": "market-data"}),
+    )
+    .await;
+    let addresses: Vec<&str> = all["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["address"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        addresses.len(),
+        6,
+        "five live windows plus the expired one: {addresses:?}"
+    );
+    for (session, _, _) in windows {
+        assert!(addresses.contains(&format!("joaquin/{session}").as_str()));
+    }
+    assert!(
+        !addresses.iter().any(|a| a.starts_with("dani/")),
+        "other project"
+    );
+    let expired = all["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session"] == "s-stale001")
+        .expect("expired sessions are listed unless online_only");
+    assert_eq!(expired["online"], false);
+    assert_eq!(expired["status"], "offline");
+
+    let reviewers = call(
+        &clients[0],
+        "list_sessions",
+        json!({"project": "market-data", "role": "review", "online_only": true}),
+    )
+    .await;
+    let mut review_addresses: Vec<String> = reviewers["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["address"].as_str().unwrap().to_owned())
+        .collect();
+    review_addresses.sort();
+    assert_eq!(
+        review_addresses,
+        vec![
+            "joaquin/s-3a4b5c6d",
+            "joaquin/s-7e8f9a0b",
+            "joaquin/s-9c0d1e2f"
+        ],
+        "three reviewers share a role and keep three addresses; the expired one is gone"
+    );
+    assert_eq!(reviewers["count"], 3);
+
+    let design = call(&clients[0], "list_sessions", json!({"role": "Design"})).await;
+    assert_eq!(
+        design["sessions"].as_array().unwrap().len(),
+        1,
+        "labels normalise"
+    );
+    assert_eq!(design["sessions"][0]["address"], "joaquin/s-5e6f7a8b");
+
+    // whoami and list_agents carry the labels too.
+    let me = call(&clients[1], "whoami", json!({})).await;
+    assert_eq!(me["project"], "market-data");
+    assert_eq!(me["role"], "design");
+    // A window that never labelled itself gets the response it always got:
+    // the keys are absent, not null.
+    let unlabelled = connect_with_session(&h.base, &token, "s-nolabels").await;
+    let plain = call(&unlabelled, "whoami", json!({})).await;
+    assert!(plain.get("project").is_none(), "{plain}");
+    assert!(plain.get("role").is_none(), "{plain}");
+    let _ = unlabelled.cancel().await;
+    let roster = call(&clients[0], "list_agents", json!({})).await;
+    let joaquin = roster["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "joaquin")
+        .unwrap();
+    assert!(
+        joaquin["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["role"] == "design"),
+        "{joaquin}"
+    );
+
+    // Exact addressing: a message to the design window reaches only it, and
+    // a sibling's read neither sees it nor moves its cursor.
+    let design_addr = design["sessions"][0]["address"].as_str().unwrap();
+    call(
+        &clients[0],
+        "post_message",
+        json!({"to": design_addr, "body": "the header is wrong on mobile"}),
+    )
+    .await;
+    let sibling = call(&clients[2], "read_messages", json!({"scope": "inbox"})).await;
+    assert!(
+        sibling["messages"].as_array().unwrap().is_empty(),
+        "a reviewer window must not see the design window's DM: {sibling}"
+    );
+    let inbox = call(&clients[1], "read_messages", json!({"scope": "inbox"})).await;
+    assert_eq!(inbox["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        inbox["messages"][0]["body"],
+        "the header is wrong on mobile"
+    );
+    assert_eq!(inbox["messages"][0]["to_session"], "s-5e6f7a8b");
+    let again = call(&clients[1], "read_messages", json!({"scope": "inbox"})).await;
+    assert!(
+        again["messages"].as_array().unwrap().is_empty(),
+        "read once, cursor moved"
+    );
+    let me = call(&clients[1], "whoami", json!({})).await;
+    assert_eq!(me["unread_direct_messages"], 0);
+
+    // The default channel follows the project label, not the opaque id.
+    call(
+        &clients[0],
+        "create_channel",
+        json!({"name": "market-data"}),
+    )
+    .await;
+    let me = call(&clients[0], "whoami", json!({})).await;
+    assert_eq!(me["default_channel"], "market-data");
+    let posted = call(
+        &clients[0],
+        "post_message",
+        json!({"body": "posted by default"}),
+    )
+    .await;
+    assert_eq!(posted["message"]["channel"], "market-data");
+    // Clearing the project clears the default with it.
+    call(&clients[0], "heartbeat", json!({"project": ""})).await;
+    let me = call(&clients[0], "whoami", json!({})).await;
+    assert!(me["default_channel"].is_null(), "{me}");
+    assert!(me["project"].is_null());
+
+    // A shared session mixed with named ones: it is listed, because it is
+    // real presence, and it is NOT an exact address. Sending to the bare
+    // agent name reaches every window of that agent, which is exactly why
+    // `exact` is false — a caller that reads it cannot broadcast a private
+    // instruction by accident.
+    let shared = connect(&h.base, &dani_token).await;
+    call(
+        &shared,
+        "heartbeat",
+        json!({"project": "core-manager", "role": "design"}),
+    )
+    .await;
+    let mixed = call(
+        &clients[0],
+        "list_sessions",
+        json!({"project": "core-manager", "online_only": true}),
+    )
+    .await;
+    let rows = mixed["sessions"].as_array().unwrap();
+    let shared_row = rows
+        .iter()
+        .find(|s| s["session"].is_null())
+        .expect("the shared session is listed");
+    assert_eq!(shared_row["address"], "dani");
+    assert_eq!(
+        shared_row["exact"], false,
+        "a bare agent name is not one window"
+    );
+    let named_row = rows
+        .iter()
+        .find(|s| s["session"] == "s-dani0001")
+        .expect("the named session is listed");
+    assert_eq!(named_row["address"], "dani/s-dani0001");
+    assert_eq!(named_row["exact"], true);
+
+    // Prove the warning: a message to the shared row's address lands in the
+    // named window's inbox too.
+    call(
+        &clients[0],
+        "post_message",
+        json!({"to": shared_row["address"], "body": "for dani"}),
+    )
+    .await;
+    let named_inbox = call(&dani, "read_messages", json!({"scope": "inbox"})).await;
+    assert_eq!(
+        named_inbox["messages"][0]["body"], "for dani",
+        "the bare name reached the named window as well: {named_inbox}"
+    );
+    // The exact address of a named window reaches only it.
+    call(
+        &clients[0],
+        "post_message",
+        json!({"to": "dani/s-dani0001", "body": "only the named one"}),
+    )
+    .await;
+    let shared_inbox = call(&shared, "read_messages", json!({"scope": "inbox"})).await;
+    assert!(
+        shared_inbox["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["body"] != "only the named one"),
+        "an exact address must not reach the shared session: {shared_inbox}"
+    );
+    let _ = shared.cancel().await;
+
+    // Another team sees none of it.
+    let eve = connect_with_session(&h.base, &outsider, "s-eve").await;
+    let theirs = call(&eve, "list_sessions", json!({"project": "market-data"})).await;
+    assert_eq!(theirs["count"], 0);
+    let err = call_expect_error(
+        &eve,
+        "post_message",
+        json!({"to": design_addr, "body": "hi"}),
+    )
+    .await;
+    assert!(err.contains("no agent"), "{err}");
+
+    for c in clients {
+        let _ = c.cancel().await;
+    }
+    for c in [dani, stale, eve] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+// -------------------------------------------------------------- stdio proxy --
+
+/// A local configuration directory with profiles for the given agents, each
+/// with a tokens file holding its token under `_base`.
+fn proxy_config_dir(base: &str, profiles: &[(&str, &str, &str, &str)]) -> std::path::PathBuf {
+    use ai_crew_sync::context::{Profile, Profiles};
+    let dir = std::env::temp_dir().join(format!("acs-proxy-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut store = Profiles::default();
+    for (name, team, agent, token) in profiles {
+        let tokens = format!("tokens-{name}");
+        std::fs::write(dir.join(&tokens), format!("_base={token}\n")).unwrap();
+        store.profiles.insert(
+            (*name).to_owned(),
+            Profile {
+                url: base.to_owned(),
+                team: (*team).to_owned(),
+                agent: (*agent).to_owned(),
+                tokens,
+                key: None,
+            },
+        );
+    }
+    ai_crew_sync::context::save_profiles(&dir, &store).unwrap();
+    dir
+}
+
+/// Start the real proxy binary over stdio, with a scrubbed environment so
+/// nothing from the developer's shell (a BUS_TOKEN, a Claude session id)
+/// leaks into the test.
+async fn spawn_proxy(
+    config_dir: &std::path::Path,
+    project_dir: &std::path::Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Client {
+    ClientConfig::default()
+        .serve(proxy_transport(config_dir, project_dir, args, env))
+        .await
+        .expect("proxy initialize")
+}
+
+/// The proxy binary as a stdio transport, not yet connected.
+fn proxy_transport(
+    config_dir: &std::path::Path,
+    project_dir: &std::path::Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> rmcp::transport::TokioChildProcess {
+    use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+    let bin = env!("CARGO_BIN_EXE_ai-crew-sync");
+    TokioChildProcess::new(tokio::process::Command::new(bin).configure(|cmd| {
+        cmd.env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("BUS_CONFIG_DIR", config_dir)
+            .env("RUST_LOG", "warn")
+            .current_dir(project_dir)
+            .args(["mcp", "proxy", "--project-dir"])
+            .arg(project_dir)
+            .args(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+    }))
+    .expect("spawn proxy")
+}
+
+#[tokio::test]
+async fn proxy_gives_each_conversation_its_own_session_and_forwards_as_the_profile() {
+    let h = require_db!("t_proxy_basic");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(".acs.toml"),
+        "profile = \"acme\"\nproject = \"market-data\"\n",
+    )
+    .unwrap();
+
+    // Two windows, same repository, same token, no environment at all.
+    let a = spawn_proxy(&dir, &repo, &["--role", "implementation"], &[]).await;
+    let b = spawn_proxy(&dir, &repo, &["--role", "review"], &[]).await;
+
+    let sa = call(&a, "session_status", json!({})).await;
+    let sb = call(&b, "session_status", json!({})).await;
+    assert_eq!(sa["connected"], true, "{sa}");
+    assert_eq!(sa["agent"], "joaquin");
+    assert_eq!(sa["team"], "acme");
+    assert_eq!(sa["project"], "market-data", "from .acs.toml");
+    assert_eq!(sa["role"], "implementation");
+    assert_eq!(sb["role"], "review");
+    assert_eq!(sa["binding"], "instance");
+    assert_ne!(sa["session"], sb["session"], "one session per process");
+    assert!(sa["session"].as_str().unwrap().starts_with("s-"));
+    assert_eq!(
+        sa["address"],
+        format!("joaquin/{}", sa["session"].as_str().unwrap())
+    );
+    assert!(sa.get("token").is_none() && sa.get("credentials").is_none());
+
+    // Forwarded calls carry the session: whoami through each proxy is the
+    // same agent in a different session.
+    let wa = call(&a, "whoami", json!({})).await;
+    let wb = call(&b, "whoami", json!({})).await;
+    assert_eq!(wa["agent"], "joaquin");
+    assert_eq!(wa["session"], sa["session"]);
+    assert_eq!(wb["session"], sb["session"]);
+    assert_eq!(
+        wa["role"], "implementation",
+        "the proxy's heartbeat published it"
+    );
+
+    // The local tools sit beside the remote ones here, and nowhere on the
+    // bus itself.
+    let names: Vec<String> = a
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    for expected in [
+        "configure_session",
+        "session_status",
+        "whoami",
+        "post_message",
+        "list_sessions",
+    ] {
+        assert!(names.contains(&expected.to_owned()), "{names:?}");
+    }
+    let direct = connect(&h.base, &token).await;
+    let remote_names: Vec<String> = direct
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(
+        !remote_names
+            .iter()
+            .any(|n| n == "configure_session" || n == "session_status")
+    );
+
+    // Discovery sees both windows with their roles and exact addresses.
+    let found = call(
+        &direct,
+        "list_sessions",
+        json!({"project": "market-data", "online_only": true}),
+    )
+    .await;
+    let addresses: Vec<&str> = found["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["address"].as_str().unwrap())
+        .collect();
+    assert!(
+        addresses.contains(&sa["address"].as_str().unwrap()),
+        "{addresses:?}"
+    );
+    assert!(
+        addresses.contains(&sb["address"].as_str().unwrap()),
+        "{addresses:?}"
+    );
+
+    // A DM to window B is read by B only; A's cursor is untouched.
+    call(
+        &direct,
+        "post_message",
+        json!({"to": sb["address"], "body": "for the reviewer"}),
+    )
+    .await;
+    let inbox_a = call(&a, "read_messages", json!({"scope": "inbox"})).await;
+    assert!(inbox_a["messages"].as_array().unwrap().is_empty());
+    let inbox_b = call(&b, "read_messages", json!({"scope": "inbox"})).await;
+    assert_eq!(inbox_b["messages"][0]["body"], "for the reviewer");
+
+    // A role change keeps the session and reaches teammates on the next
+    // discovery; it touches this window only.
+    let changed = call(&b, "configure_session", json!({"role": "design"})).await;
+    assert_eq!(changed["status"]["session"], sb["session"]);
+    assert_eq!(changed["status"]["role"], "design");
+    assert!(changed["previous"].is_null(), "no identity change");
+    let design = call(&direct, "list_sessions", json!({"role": "design"})).await;
+    assert_eq!(design["count"], 1);
+    assert_eq!(design["sessions"][0]["address"], sb["address"]);
+    assert_eq!(
+        call(&a, "session_status", json!({})).await["role"],
+        "implementation"
+    );
+
+    for c in [a, b, direct] {
+        let _ = c.cancel().await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+/// A host on protocol `2026-07-28` rejects a list without `ttlMs` and
+/// `cacheScope`, and a call result without `resultType`; Claude Code 2.1.281
+/// then shows the proxy connected with no tools (#192). The forwarded result
+/// is the one at risk: it is deserialized from the bus's own reply, where
+/// the field can be absent.
+#[tokio::test]
+async fn the_proxy_serves_the_fields_mcp_2026_07_28_requires() {
+    let h = require_db!("t_proxy_mcp_2026");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let proxy = connect_modern(proxy_transport(&dir, &repo, &[], &[])).await;
+    // whoami is forwarded to the bus; session_status is answered locally.
+    assert_mcp_2026_07_28_results(&proxy, &["whoami", "session_status"]).await;
+    let _ = proxy.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+/// Adding a profile never makes it the user default on its own (#193): a
+/// default answers for every directory without a .acs.toml and for every
+/// host that starts the proxy without BUS_TOKEN. When a default is set on
+/// purpose, what runs under it says so.
+#[tokio::test]
+async fn adding_a_profile_never_makes_it_the_default_on_its_own() {
+    let h = require_db!("t_profile_default");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = std::env::temp_dir().join(format!("acs-profiles-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("tokens-acme"), format!("_base={token}\n")).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ai-crew-sync");
+    let run = |args: &[&str], cwd: &std::path::Path| {
+        let out = std::process::Command::new(bin)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("BUS_CONFIG_DIR", &dir)
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .expect("run ai-crew-sync");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let add = |name: &str, extra: &[&str]| {
+        let mut args = vec![
+            "context", "profile", "add", "--name", name, "--url", &h.base, "--team", "acme",
+            "--agent", "joaquin",
+        ];
+        args.extend_from_slice(extra);
+        run(&args, &dir)
+    };
+    let default = || ai_crew_sync::context::load_profiles(&dir).unwrap().default;
+
+    // The first profile on an empty store: saved, and nothing else.
+    let out = add("first", &[]);
+    assert!(out.contains("no user default is set"), "{out}");
+    assert_eq!(default(), None, "the first profile became the default");
+
+    // Asked for: it is the default, and the output says what that means.
+    let out = add("chosen", &["--default"]);
+    assert!(out.contains("'chosen' is now the user default"), "{out}");
+    assert_eq!(default().as_deref(), Some("chosen"));
+
+    // Another profile leaves the chosen default alone.
+    let out = add("later", &[]);
+    assert!(out.contains("the user default stays 'chosen'"), "{out}");
+    assert_eq!(default().as_deref(), Some("chosen"));
+
+    // Somewhere no .acs.toml names a profile, the default applies, and
+    // both `context show` and the proxy's own status name it as the source.
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let shown = run(&["context", "show"], &elsewhere);
+    assert!(
+        shown.contains("the user default, which applies wherever no .acs.toml names a profile"),
+        "{shown}"
+    );
+    let proxy = spawn_proxy(&dir, &elsewhere, &[], &[]).await;
+    let status = call(&proxy, "session_status", json!({})).await;
+    assert_eq!(status["connected"], true, "{status}");
+    assert_eq!(status["profile"], "chosen");
+    assert!(
+        status["credential_from"]
+            .as_str()
+            .is_some_and(|s| s.contains("the user default")),
+        "{status}"
+    );
+
+    let _ = proxy.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+/// `.acs.toml` names profiles from this machine's `profiles.toml`, so
+/// `set-project` keeps it out of git: it lists it in the repository's
+/// `info/exclude` (shared by linked worktrees), once, and never advises a
+/// commit (#197). Git's own global configuration is isolated, since a
+/// global ignore would hide exactly what this checks.
+#[test]
+fn set_project_keeps_the_project_file_out_of_git() {
+    let root = std::env::temp_dir().join(format!("acs-local-{}", Uuid::new_v4()));
+    let cfg = root.join("config");
+    let home = root.join("home");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let mut store = ai_crew_sync::context::Profiles::default();
+    store.profiles.insert(
+        "acme".into(),
+        ai_crew_sync::context::Profile {
+            url: "http://127.0.0.1:1".into(),
+            team: "acme".into(),
+            agent: "joaquin".into(),
+            tokens: "tokens-acme".into(),
+            key: None,
+        },
+    );
+    ai_crew_sync::context::save_profiles(&cfg, &store).unwrap();
+    let env = |cmd: &mut std::process::Command| {
+        cmd.env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("BUS_CONFIG_DIR", &cfg);
+    };
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let mut cmd = std::process::Command::new("git");
+        env(&mut cmd);
+        let out = cmd
+            .current_dir(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let set_project = |dir: &std::path::Path| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-crew-sync"));
+        env(&mut cmd);
+        let out = cmd
+            .current_dir(dir)
+            .args(["context", "set-project", "--profile", "acme"])
+            .output()
+            .expect("run set-project");
+        assert!(out.status.success(), "{out:?}");
+        (
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
+    };
+
+    let repo = root.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+
+    let (out, _) = set_project(&repo);
+    assert!(out.contains("kept local: added .acs.toml"), "{out}");
+    assert!(!out.to_lowercase().contains("commit it:"), "{out}");
+    assert!(repo.join(".acs.toml").is_file());
+    let status = git(&repo, &["status", "--porcelain", "--untracked-files=all"]);
+    assert!(!status.contains(".acs.toml"), "git sees the file: {status}");
+
+    // Again: already listed, not listed twice.
+    let (out, _) = set_project(&repo);
+    assert!(out.contains("already listed"), "{out}");
+    let exclude = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+    assert_eq!(
+        exclude.lines().filter(|l| l.trim() == ".acs.toml").count(),
+        1
+    );
+
+    // A linked worktree shares the main repository's exclude.
+    let wt = root.join("market-data-wt");
+    git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+    let (out, _) = set_project(&wt);
+    assert!(out.contains("already listed"), "{out}");
+    let status = git(&wt, &["status", "--porcelain", "--untracked-files=all"]);
+    assert!(
+        !status.contains(".acs.toml"),
+        "the worktree sees the file: {status}"
+    );
+
+    // An exclude cannot hide a tracked file: say how to untrack it.
+    let tracked = root.join("tracked");
+    std::fs::create_dir_all(&tracked).unwrap();
+    git(&tracked, &["init", "-q"]);
+    std::fs::write(tracked.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    git(&tracked, &["add", ".acs.toml"]);
+    git(&tracked, &["commit", "-q", "-m", "tracked"]);
+    let (_, err) = set_project(&tracked);
+    assert!(err.contains("git rm --cached .acs.toml"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn proxy_binds_a_conversation_id_to_a_stable_session() {
+    use ai_crew_sync::proxy::session_for;
+
+    let h = require_db!("t_proxy_bind");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+
+    // The same conversation id, twice (a restart, a resume): one session.
+    let first = spawn_proxy(&dir, &repo, &["--host-session", "conv-1"], &[]).await;
+    let s1 = call(&first, "session_status", json!({})).await;
+    let _ = first.cancel().await;
+    let again = spawn_proxy(&dir, &repo, &["--host-session", "conv-1"], &[]).await;
+    let s1b = call(&again, "session_status", json!({})).await;
+    assert_eq!(s1["session"], s1b["session"], "reconnect keeps the session");
+    assert_eq!(s1["binding"], "explicit");
+    assert_eq!(s1["session"], session_for("conv-1"));
+    // A forked conversation has another id and another session.
+    let fork = spawn_proxy(&dir, &repo, &[], &[("BUS_HOST_SESSION", "conv-2")]).await;
+    let s2 = call(&fork, "session_status", json!({})).await;
+    assert_ne!(s2["session"], s1["session"]);
+    assert_eq!(s2["session"], session_for("conv-2"));
+    // Claude Code's variable binds the same way.
+    let claude = spawn_proxy(&dir, &repo, &[], &[("CLAUDE_CODE_SESSION_ID", "conv-1")]).await;
+    let s3 = call(&claude, "session_status", json!({})).await;
+    assert_eq!(s3["binding"], "claude-code");
+    assert_eq!(
+        s3["session"], s1["session"],
+        "same conversation id, same session"
+    );
+    // Identity is independent of the binding: still the profile's agent.
+    assert_eq!(call(&claude, "whoami", json!({})).await["agent"], "joaquin");
+    for c in [again, fork, claude] {
+        let _ = c.cancel().await;
+    }
+
+    // A host that sends the conversation id in request metadata (Codex):
+    // the first id binds, a second one on the same process is refused.
+    let meta = spawn_proxy(&dir, &repo, &[], &[]).await;
+    let before = call(&meta, "session_status", json!({})).await;
+    assert_eq!(before["binding"], "instance");
+    let with_thread = |thread: &str| {
+        let mut params = CallToolRequestParams::new("whoami");
+        let mut m = rmcp::model::JsonObject::new();
+        m.insert("threadId".into(), json!(thread));
+        params.meta = Some(rmcp::model::RequestMetaObject::from(m));
+        params
+    };
+    let r = meta.call_tool(with_thread("thread-A")).await.unwrap();
+    let who = r.structured_content.unwrap();
+    assert_eq!(who["session"], session_for("thread-A"));
+    let after = call(&meta, "session_status", json!({})).await;
+    assert_eq!(after["binding"], "request-meta");
+    assert_eq!(after["session"], session_for("thread-A"));
+    let err = meta
+        .call_tool(with_thread("thread-B"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("another conversation"), "{err}");
+    assert!(
+        err.contains("one `ai-crew-sync mcp proxy` per conversation"),
+        "{err}"
+    );
+    // The bound conversation keeps working.
+    let r = meta.call_tool(with_thread("thread-A")).await.unwrap();
+    assert_eq!(r.is_error, Some(false));
+    let _ = meta.cancel().await;
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn proxy_switches_profiles_only_after_verification_and_never_across_teams() {
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_proxy_switch");
+    let joaquin = seed_agent(&h.pool, "acme", "joaquin").await;
+    let marta = seed_agent(&h.pool, "acme", "marta").await;
+    let eve = seed_agent(&h.pool, "other", "eve").await;
+    let dir = proxy_config_dir(
+        h.base.as_str(),
+        &[
+            ("me", "acme", "joaquin", &joaquin),
+            ("marta", "acme", "marta", &marta),
+            ("other", "other", "eve", &eve),
+            // Claims to be marta, holds eve's token: verification must catch it.
+            ("liar", "acme", "marta", &eve),
+        ],
+    );
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(".acs.toml"),
+        "profile = \"me\"\nproject = \"api\"\n",
+    )
+    .unwrap();
+
+    // This conversation id hashes to the label `s-a7da401d8d70`. The bus
+    // quotes it when marta is refused joaquin's lease below, and the proxy
+    // once read that "401" as its own credential being rejected.
+    let p = spawn_proxy(
+        &dir,
+        &repo,
+        &["--role", "implementation"],
+        &[("BUS_HOST_SESSION", "conv-1617")],
+    )
+    .await;
+    let start = call(&p, "session_status", json!({})).await;
+    assert_eq!(start["agent"], "joaquin");
+    let session = start["session"].as_str().unwrap().to_owned();
+    assert_eq!(
+        session, "s-a7da401d8d70",
+        "the fixture label moved; pick another id"
+    );
+
+    // Hold something as joaquin so the switch has something to report.
+    call(
+        &p,
+        "create_task",
+        json!({"key": "api#1", "title": "wire it"}),
+    )
+    .await;
+    call(&p, "claim_task", json!({"key": "api#1"})).await;
+    call(&p, "acquire_lock", json!({"name": "api:deploy"})).await;
+
+    // A profile that fails verification changes nothing.
+    let r = p
+        .call_tool(
+            CallToolRequestParams::new("configure_session")
+                .with_arguments(serde_json::from_value(json!({"profile": "liar"})).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.is_error, Some(true), "{r:?}");
+    let text = format!("{:?}", r.content);
+    assert!(text.contains("expects marta@acme"), "{text}");
+    assert_eq!(
+        call(&p, "whoami", json!({})).await["agent"],
+        "joaquin",
+        "still joaquin"
+    );
+
+    // Another team: refused, with the reason.
+    let r = p
+        .call_tool(
+            CallToolRequestParams::new("configure_session")
+                .with_arguments(serde_json::from_value(json!({"profile": "other"})).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.is_error, Some(true));
+    let text = format!("{:?}", r.content);
+    assert!(text.contains("new conversation"), "{text}");
+    assert!(text.contains("team 'acme'"), "{text}");
+    assert_eq!(call(&p, "whoami", json!({})).await["agent"], "joaquin");
+
+    // A same-team switch while a long poll is in flight: the poll is
+    // cancelled, not replayed; the new identity answers afterwards; the old
+    // one's claim and lock are reported, not transferred; role and session
+    // stay.
+    let waiter = {
+        let p2 = p.clone();
+        tokio::spawn(async move {
+            p2.call_tool(
+                CallToolRequestParams::new("wait_for_updates").with_arguments(
+                    serde_json::from_value(json!({"timeout_seconds": 20})).unwrap(),
+                ),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let switched = call(&p, "configure_session", json!({"profile": "marta"})).await;
+    let wait_outcome = tokio::time::timeout(std::time::Duration::from_secs(8), waiter)
+        .await
+        .expect("the in-flight poll must end at the switch, not at its own timeout")
+        .unwrap();
+    let err = wait_outcome
+        .expect_err("cancelled by the context switch")
+        .to_string();
+    assert!(err.contains("switched credentials"), "{err}");
+    assert_eq!(switched["status"]["agent"], "marta");
+    assert_eq!(switched["status"]["team"], "acme");
+    assert_eq!(
+        switched["status"]["session"], session,
+        "session survives the switch"
+    );
+    assert_eq!(switched["status"]["role"], "implementation");
+    assert_eq!(switched["previous"]["agent"], "joaquin");
+    assert_eq!(switched["previous"]["open_claims"], json!(["api#1"]));
+    assert_eq!(switched["previous"]["held_locks"], json!(["api:deploy"]));
+
+    // The window's own channel is applied to a message that names none, so
+    // the default the instructions advertise is the one the bus sees.
+    call(&p, "create_channel", json!({"name": "api"})).await;
+    let posted = call(&p, "post_message", json!({"body": "from the window"})).await;
+    assert_eq!(posted["message"]["channel"], "api");
+    // An explicit channel and a direct message are untouched.
+    call(&p, "create_channel", json!({"name": "other"})).await;
+    let elsewhere = call(
+        &p,
+        "post_message",
+        json!({"channel": "other", "body": "explicit"}),
+    )
+    .await;
+    assert_eq!(elsewhere["message"]["channel"], "other");
+    let dm = call(
+        &p,
+        "post_message",
+        json!({"to": "joaquin", "body": "direct"}),
+    )
+    .await;
+    assert!(dm["message"]["channel"].is_null(), "{dm}");
+
+    // A label the bus would reject is refused here too, and changes nothing.
+    let before_role = call(&p, "session_status", json!({})).await["role"].clone();
+    let r = p
+        .call_tool(
+            CallToolRequestParams::new("configure_session")
+                .with_arguments(serde_json::from_value(json!({"role": "code review!"})).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.is_error, Some(true), "{r:?}");
+    assert_eq!(
+        call(&p, "session_status", json!({})).await["role"],
+        before_role
+    );
+    assert_eq!(call(&p, "whoami", json!({})).await["agent"], "marta");
+    // Ownership stayed with joaquin: marta holds neither the lease nor the
+    // lock, so she can renew and release nothing of his.
+    let err = call_expect_error(&p, "renew_task_lease", json!({"key": "api#1"})).await;
+    assert!(err.contains("joaquin"), "{err}");
+    let err = call_expect_error(&p, "release_lock", json!({"name": "api:deploy"})).await;
+    assert!(err.contains("joaquin"), "{err}");
+
+    // A revoked token surfaces as an error on the next forwarded call, and a
+    // working profile recovers the window.
+    let (marta_id,): (Uuid,) = sqlx::query_as(
+        "SELECT t.id FROM api_tokens t JOIN agents a ON a.id = t.agent_id WHERE a.name = 'marta'",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    store::revoke_token(&h.pool, Actor::Cli, None, marta_id)
+        .await
+        .unwrap();
+    let err = p
+        .call_tool(CallToolRequestParams::new("whoami"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("revoked or rotated"), "{err}");
+    assert!(err.contains("configure_session"), "{err}");
+    assert!(err.contains("profile 'marta'"), "{err}");
+    let hurt = call(&p, "session_status", json!({})).await;
+    assert!(
+        hurt["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("rejected"),
+        "the window reports its own broken credential: {hurt}"
+    );
+    let back = call(&p, "configure_session", json!({"profile": "me"})).await;
+    assert_eq!(back["status"]["agent"], "joaquin");
+    assert_eq!(call(&p, "whoami", json!({})).await["session"], session);
+
+    let _ = p.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+// ------------------------------------------------- host integration (#86) --
+
+/// Run a plugin hook script the way a host would: payload on stdin, the
+/// repository as cwd, and only the environment a hook actually gets. No
+/// BUS_TOKEN, no BUS_SESSION — everything is resolved from the profiles and
+/// the conversation id in the payload.
+async fn run_hook(
+    script: &str,
+    config_dir: &std::path::Path,
+    project_dir: &std::path::Path,
+    payload: &str,
+    extra_args: &[&str],
+) -> String {
+    run_hook_env(script, config_dir, project_dir, payload, extra_args, &[]).await
+}
+
+/// `run_hook` with extra environment, for the cases where what the
+/// operator exported must not win over the window's binding.
+async fn run_hook_env(
+    script: &str,
+    config_dir: &std::path::Path,
+    project_dir: &std::path::Path,
+    payload: &str,
+    extra_args: &[&str],
+    env: &[(&str, &str)],
+) -> String {
+    // The hook talks HTTP to the harness, which runs on this runtime: waiting
+    // for the child on this thread deadlocks both. Off to a blocking thread,
+    // with a bound so a wedged hook fails the test instead of hanging CI.
+    let (script, config_dir, project_dir, payload) = (
+        script.to_owned(),
+        config_dir.to_path_buf(),
+        project_dir.to_path_buf(),
+        payload.to_owned(),
+    );
+    let extra: Vec<String> = extra_args.iter().map(|a| (*a).to_owned()).collect();
+    let env: Vec<(String, String)> = env
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            run_hook_blocking(&script, &config_dir, &project_dir, &payload, &extra, &env)
+        }),
+    )
+    .await
+    .expect("the hook did not finish within 30s")
+    .expect("the hook task panicked")
+}
+
+fn run_hook_blocking(
+    script: &str,
+    config_dir: &std::path::Path,
+    project_dir: &std::path::Path,
+    payload: &str,
+    extra_args: &[String],
+    env: &[(String, String)],
+) -> String {
+    use std::io::Write;
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("plugin/scripts")
+        .join(script);
+    let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_ai-crew-sync"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = std::process::Command::new("sh")
+        .arg(&script)
+        .args(extra_args.iter().map(String::as_str))
+        .current_dir(project_dir)
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("TMPDIR", config_dir)
+        .env("BUS_CONFIG_DIR", config_dir)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("hook finished");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The workflow the whole stack exists for: five conversations in one
+/// repository, on one token, with no per-window export and no new token —
+/// implementation, design, a Claude review and two Codex reviews. They find
+/// each other, send targeted corrections, and each window's hooks act on its
+/// own session only.
+#[tokio::test]
+async fn five_conversations_share_a_repo_and_stay_separate() {
+    let h = require_db!("t_host_integration");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(".acs.toml"),
+        "profile = \"acme\"\nproject = \"market-data\"\nchannel = \"market-data\"\n",
+    )
+    .unwrap();
+
+    // Five windows. Two hosts that expose a conversation id (Claude Code's
+    // variable and an explicit flag), and three that expose none.
+    let windows = [
+        ("impl", "implementation", Some("conv-impl")),
+        ("design", "design", Some("conv-design")),
+        ("claude-review", "review", None),
+        ("codex-review-1", "review", None),
+        ("codex-review-2", "review", None),
+    ];
+    let mut clients = Vec::new();
+    let mut ids = Vec::new();
+    for (name, role, conv) in windows {
+        let env: Vec<(&str, &str)> = match conv {
+            Some(c) if name == "impl" => vec![("CLAUDE_CODE_SESSION_ID", c)],
+            Some(c) => vec![("BUS_HOST_SESSION", c)],
+            None => vec![],
+        };
+        let c = spawn_proxy(&dir, &repo, &["--role", role], &env).await;
+        let st = call(&c, "session_status", json!({})).await;
+        assert_eq!(st["connected"], true, "{name}: {st}");
+        assert_eq!(st["agent"], "joaquin");
+        ids.push((
+            name,
+            st["session"].as_str().unwrap().to_owned(),
+            st["address"].as_str().unwrap().to_owned(),
+        ));
+        clients.push(c);
+    }
+    let sessions: std::collections::HashSet<&str> =
+        ids.iter().map(|(_, s, _)| s.as_str()).collect();
+    assert_eq!(
+        sessions.len(),
+        5,
+        "five conversations, five sessions: {ids:?}"
+    );
+
+    // Design discovers the implementation window and sends a correction; the
+    // two same-role Codex reviewers stay distinct.
+    let design = &clients[1];
+    let found = call(
+        design,
+        "list_sessions",
+        json!({"project": "market-data", "role": "implementation", "online_only": true}),
+    )
+    .await;
+    assert_eq!(found["count"], 1);
+    let impl_addr = found["sessions"][0]["address"].as_str().unwrap().to_owned();
+    assert_eq!(impl_addr, ids[0].2);
+    call(
+        design,
+        "post_message",
+        json!({"to": impl_addr, "body": "the empty state needs a spinner"}),
+    )
+    .await;
+    let reviewers = call(
+        design,
+        "list_sessions",
+        json!({"project": "market-data", "role": "review", "online_only": true}),
+    )
+    .await;
+    assert_eq!(
+        reviewers["count"], 3,
+        "three reviewers share a role, three addresses"
+    );
+
+    // The implementation window reads it, replies to the exact sender, and
+    // no other window's inbox moved.
+    let implementation = &clients[0];
+    let inbox = call(implementation, "read_messages", json!({"scope": "inbox"})).await;
+    assert_eq!(inbox["messages"].as_array().unwrap().len(), 1);
+    let msg = &inbox["messages"][0];
+    assert_eq!(msg["body"], "the empty state needs a spinner");
+    let from = format!(
+        "{}/{}",
+        msg["from"].as_str().unwrap(),
+        msg["from_session"].as_str().unwrap()
+    );
+    assert_eq!(from, ids[1].2);
+    call(
+        implementation,
+        "post_message",
+        json!({"to": from, "body": "added", "reply_to": msg["id"]}),
+    )
+    .await;
+    let reply = call(design, "read_messages", json!({"scope": "inbox"})).await;
+    assert_eq!(reply["messages"][0]["body"], "added");
+    for c in clients.iter().skip(2) {
+        let quiet = call(c, "read_messages", json!({"scope": "inbox"})).await;
+        assert!(
+            quiet["messages"].as_array().unwrap().is_empty(),
+            "a reviewer saw another window's direct message"
+        );
+    }
+
+    // The workflow the stack exists for, end to end: design opens a thread
+    // with the implementation window and both reviewers, each acknowledges
+    // for itself, and the sender can see who acted.
+    enable_conversations(&h.pool, "acme").await;
+    let convo = call(
+        design,
+        "create_conversation",
+        json!({"title": "the empty state", "private": true,
+               "invite": [ids[0].2.clone(), ids[2].2.clone(), ids[3].2.clone()]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    for c in [&clients[0], &clients[2], &clients[3]] {
+        call(c, "join_conversation", json!({"conversation_id": cid})).await;
+    }
+    let asked = call(
+        design,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "the empty state needs a spinner",
+               "request_id": Uuid::new_v4().to_string()}),
+    )
+    .await;
+    let asked_id = asked["message_id"].as_str().unwrap().to_owned();
+    assert_eq!(asked["recipients"].as_array().unwrap().len(), 3);
+
+    // The fifth window was never invited and sees nothing.
+    let err = call_expect_error(
+        &clients[4],
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("no such conversation"), "{err}");
+
+    // Independent observations: implementation resolves, one reviewer only
+    // acknowledges, the other has not answered.
+    call(
+        &clients[0],
+        "ack_message",
+        json!({"message_id": asked_id, "resolved": true, "note": "added in 4d21f"}),
+    )
+    .await;
+    call(&clients[2], "ack_message", json!({"message_id": asked_id})).await;
+    let receipts = call(
+        design,
+        "get_message_receipts",
+        json!({"message_id": asked_id}),
+    )
+    .await;
+    assert_eq!(receipts["total"], 3);
+    assert_eq!(receipts["acknowledged"], 2);
+    assert_eq!(receipts["resolved"], 1, "{receipts}");
+    let pending = receipts["receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["address"] == ids[3].2.as_str())
+        .unwrap();
+    assert!(
+        pending["acknowledged_at"].is_null(),
+        "still to answer: {pending}"
+    );
+    assert!(
+        pending["presented_at"].is_null(),
+        "unknown presentation stays unknown"
+    );
+
+    // A hook of the implementation conversation acts on THAT window: the
+    // same conversation id resolves to the same session, so a heartbeat from
+    // the hook updates this window's presence and nobody else's.
+    run_hook("heartbeat.sh", &dir, &repo, "", &["busy"]).await;
+    let after = call(
+        design,
+        "list_sessions",
+        json!({"project": "market-data", "online_only": true}),
+    )
+    .await;
+    assert_eq!(after["count"], 5, "the hook did not create a sixth session");
+
+    // SessionStart for the design conversation injects its own identity,
+    // and only after the bus confirmed it.
+    let out = run_hook(
+        "session-start.sh",
+        &dir,
+        &repo,
+        &json!({"session_id": "conv-design", "cwd": repo.display().to_string()}).to_string(),
+        &[],
+    )
+    .await;
+    let injected: Value = serde_json::from_str(out.trim()).expect("hook emitted JSON");
+    let context = injected["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(context.contains("agent 'joaquin'"), "{context}");
+    assert!(
+        context.contains(&ids[1].1),
+        "the design window's own session: {context}"
+    );
+    assert!(context.contains("role 'design'"), "{context}");
+    for (name, session, _) in ids.iter().skip(2) {
+        assert!(
+            !context.contains(session.as_str()),
+            "{name}'s session leaked: {context}"
+        );
+    }
+
+    // A conversation with no bus configured injects nothing at all.
+    let empty_cfg = dir.join("no-profiles");
+    std::fs::create_dir_all(&empty_cfg).unwrap();
+    let out = run_hook(
+        "session-start.sh",
+        &empty_cfg,
+        &repo,
+        &json!({"session_id": "conv-nowhere"}).to_string(),
+        &[],
+    )
+    .await;
+    assert!(out.trim().is_empty(), "unconfigured session start: {out}");
+
+    // Ending one window leaves the others alone: no idled presence, no
+    // drained inbox, no released claim.
+    call(
+        implementation,
+        "create_task",
+        json!({"key": "md#1", "title": "spinner"}),
+    )
+    .await;
+    call(implementation, "claim_task", json!({"key": "md#1"})).await;
+    let closing = clients.remove(4);
+    let _ = closing.cancel().await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let implementation = &clients[0];
+    let mine = call(implementation, "list_tasks", json!({"mine_only": true})).await;
+    assert_eq!(mine["tasks"][0]["status"], "claimed");
+    assert_eq!(mine["tasks"][0]["claimed_session"], ids[0].1);
+    let still = call(
+        implementation,
+        "list_sessions",
+        json!({"project": "market-data", "role": "implementation", "online_only": true}),
+    )
+    .await;
+    assert_eq!(still["count"], 1, "the surviving window is still online");
+    assert_eq!(
+        call(implementation, "whoami", json!({})).await["session"],
+        ids[0].1
+    );
+
+    for c in clients {
+        let _ = c.cancel().await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+/// A resumed conversation starts a new proxy while SessionStart runs: the
+/// old proxy stamped the binding closed on exit and the new one clears it a
+/// moment later. The hook waits for that instead of reporting the
+/// credential gone and loading no bus context (#199).
+#[tokio::test]
+async fn session_start_waits_for_a_resuming_proxy() {
+    let h = require_db!("t_resume_race");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let conv = [("BUS_HOST_SESSION", "conv-resumed")];
+    let status = || {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_ai-crew-sync"))
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("BUS_CONFIG_DIR", &dir)
+            .args([
+                "context",
+                "hook",
+                "--binding",
+                "conv-resumed",
+                "--event",
+                "status",
+            ])
+            .output()
+            .expect("run context hook");
+        String::from_utf8(out.stdout).unwrap()
+    };
+
+    // The window before the resume, then its proxy exits.
+    let first = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let session = call(&first, "session_status", json!({})).await["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let _ = first.cancel().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !status().contains("no-credential") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never closed: {}",
+            status()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // SessionStart begins while the binding is closed; the new proxy
+    // resumes the conversation a moment later.
+    let payload =
+        json!({"session_id": "conv-resumed", "cwd": repo.display().to_string()}).to_string();
+    let hook = {
+        let (dir, repo) = (dir.clone(), repo.clone());
+        tokio::spawn(async move { run_hook("session-start.sh", &dir, &repo, &payload, &[]).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let resumed = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let st = call(&resumed, "session_status", json!({})).await;
+    assert_eq!(
+        st["session"],
+        session.as_str(),
+        "the conversation resumed its window"
+    );
+
+    let out = hook.await.unwrap();
+    assert!(!out.contains("credential is gone"), "{out}");
+    let injected: Value = serde_json::from_str(out.trim()).expect("hook emitted JSON");
+    let context = injected["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(context.contains("agent 'joaquin'"), "{context}");
+    assert!(context.contains(&session), "{context}");
+
+    // A conversation that is really closed still says so, after the wait.
+    let _ = resumed.cancel().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !status().contains("no-credential") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never closed: {}",
+            status()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let payload =
+        json!({"session_id": "conv-resumed", "cwd": repo.display().to_string()}).to_string();
+    let out = run_hook_env(
+        "session-start.sh",
+        &dir,
+        &repo,
+        &payload,
+        &[],
+        &[("BUS_RESUME_WAIT_SECS", "1")],
+    )
+    .await;
+    assert!(out.contains("credential is gone"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+// ------------------------------------------------- authenticated sessions --
+
+/// A session credential proves which window is calling: it is derived from an
+/// agent token, cannot mint anything, dies with its parent, expires on its
+/// own, and a resume fences the connection it replaced.
+#[tokio::test]
+async fn session_credentials_prove_a_window_and_die_with_their_parent() {
+    let h = require_db!("t_sessions_auth");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let other = seed_agent(&h.pool, "acme", "marta").await;
+
+    // Registration takes the agent token and derives everything from it.
+    let agent = connect_with_session(&h.base, &token, "conv-a").await;
+    let cred = call(
+        &agent,
+        "register_session",
+        json!({"session": "conv-a", "ttl_seconds": 3600}),
+    )
+    .await;
+    let session_token = cred["session_token"].as_str().unwrap().to_owned();
+    assert!(session_token.starts_with("acss_"), "{cred}");
+    assert_eq!(cred["session"], "conv-a");
+    assert_eq!(cred["address"], "joaquin/conv-a");
+    assert_eq!(cred["epoch"], 1);
+    assert!(cred["expires_in_seconds"].as_i64().unwrap() <= 3600);
+
+    // It authenticates as that agent in that session, and says so.
+    let window = connect(&h.base, &session_token).await;
+    let me = call(&window, "whoami", json!({})).await;
+    assert_eq!(me["agent"], "joaquin");
+    assert_eq!(me["team"], "acme");
+    assert_eq!(me["session"], "conv-a", "the label is proven, not sent");
+    assert_eq!(me["session_identity"]["epoch"], 1);
+    assert_eq!(me["session_identity"]["session_id"], cred["session_id"]);
+    // A plain agent token has no proven identity.
+    assert!(call(&agent, "whoami", json!({})).await["session_identity"].is_null());
+
+    // It cannot mint: not another session, not anything else.
+    let err = call_expect_error(&window, "register_session", json!({"session": "conv-b"})).await;
+    assert!(err.contains("cannot register another session"), "{err}");
+
+    // A header that disagrees with the proof is refused outright, so a
+    // session credential can never be widened into another window.
+    let resp = reqwest::Client::new()
+        .post(format!("{}/mcp", h.base))
+        .header("Authorization", format!("Bearer {session_token}"))
+        .header("X-Crew-Session", "someone-elses-window")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("authenticates session 'conv-a'"),
+        "{body}"
+    );
+    // The same header, agreeing, is simply redundant.
+    assert_eq!(
+        mcp_status_with_session(&h.base, &session_token, "conv-a").await,
+        200
+    );
+
+    // Renewal extends without disturbing the connection: same secret, same
+    // epoch, later expiry.
+    let renewed = call(&window, "renew_session", json!({"ttl_seconds": 7200})).await;
+    assert!(
+        renewed["session_token"].is_null(),
+        "renewal returns no secret"
+    );
+    assert_eq!(renewed["epoch"], 1);
+    assert!(renewed["expires_in_seconds"].as_i64().unwrap() > 3600);
+    assert_eq!(call(&window, "whoami", json!({})).await["agent"], "joaquin");
+
+    // The agent token cannot take a live window: holding it is not proof of
+    // being that conversation.
+    let err = call_expect_error(&agent, "register_session", json!({"session": "conv-a"})).await;
+    assert!(err.contains("already registered and still live"), "{err}");
+    assert!(err.contains("resume_session"), "{err}");
+    assert_eq!(
+        call(&window, "whoami", json!({})).await["session_identity"]["epoch"],
+        1,
+        "the refused registration changed nothing"
+    );
+
+    // A resume rotates the secret and bumps the epoch; the old credential is
+    // dead and the old connection is fenced by its stale epoch. The proof is
+    // the session's own credential.
+    let resumed = call(&window, "resume_session", json!({})).await;
+    assert_eq!(resumed["epoch"], 2);
+    let resumed_token = resumed["session_token"].as_str().unwrap().to_owned();
+    let window_again = connect(&h.base, &resumed_token).await;
+    assert_ne!(resumed_token, session_token);
+    assert_eq!(
+        mcp_status(&h.base, &session_token).await,
+        401,
+        "old secret is dead"
+    );
+    assert_eq!(
+        mcp_status_with_epoch(&h.base, &resumed_token, 1).await,
+        409,
+        "a connection carrying the old epoch is stale"
+    );
+    assert_eq!(mcp_status_with_epoch(&h.base, &resumed_token, 2).await, 200);
+    let _ = window.cancel().await;
+
+    // Fencing is not only a pre-dispatch check. The middleware's check runs
+    // before the handler, so a request that passed it and then waited on a
+    // row lock would otherwise commit into the session that replaced it. The
+    // guard re-checks inside the writing transaction, which is where it has
+    // to be: here it is exercised directly, with the epoch moved after the
+    // transaction opened.
+    use ai_crew_sync::store::sessions;
+    let stale_ctx = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'joaquin'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "joaquin".into(),
+        team_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM teams WHERE slug = 'acme'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        team_slug: "acme".into(),
+        session: "conv-a".into(),
+        session_id: Some(
+            resumed["session_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        ),
+        // The epoch this connection was admitted with.
+        session_epoch: Some(2),
+        token_id: None,
+    };
+    // Same epoch: the write may proceed.
+    let mut tx = h.pool.begin().await.unwrap();
+    sessions::guard(&mut tx, &stale_ctx)
+        .await
+        .expect("current epoch passes");
+    tx.rollback().await.unwrap();
+
+    // Now the window is resumed by its owner, and the connection admitted at
+    // epoch 2 is refused *inside* the transaction rather than committing.
+    let bumped = call(&window_again, "resume_session", json!({})).await;
+    assert_eq!(bumped["epoch"], 3);
+    // The resume rotated the secret again, so later connections use this one.
+    let resumed_token = bumped["session_token"].as_str().unwrap().to_owned();
+    let _ = window_again.cancel().await;
+    let mut tx = h.pool.begin().await.unwrap();
+    let err = sessions::guard(&mut tx, &stale_ctx)
+        .await
+        .expect_err("a replaced connection must not write");
+    let err = err.to_string();
+    assert!(err.contains("stale"), "{err}");
+    assert!(err.contains("Nothing was written"), "{err}");
+    tx.rollback().await.unwrap();
+
+    // And a revoked session is refused the same way, not only at the door.
+    sqlx::query("UPDATE agent_sessions SET revoked_at = now() WHERE label = 'conv-a'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let mut tx = h.pool.begin().await.unwrap();
+    let current = ai_crew_sync::auth::AuthCtx {
+        session_epoch: Some(3),
+        ..stale_ctx.clone()
+    };
+    let err = sessions::guard(&mut tx, &current)
+        .await
+        .expect_err("a revoked session must not write")
+        .to_string();
+    assert!(err.contains("no longer valid"), "{err}");
+    tx.rollback().await.unwrap();
+    sqlx::query("UPDATE agent_sessions SET revoked_at = NULL WHERE label = 'conv-a'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    // Two agents, two sessions of the same label: separate rows, separate
+    // addresses, no collision.
+    let marta = connect(&h.base, &other).await;
+    let hers = call(&marta, "register_session", json!({"session": "conv-a"})).await;
+    assert_eq!(hers["address"], "marta/conv-a");
+    assert_ne!(hers["session_id"], resumed["session_id"]);
+
+    // Revocation: a window can close another window of its own agent, and
+    // never one of somebody else's.
+    let live = connect(&h.base, &resumed_token).await;
+    call(&agent, "register_session", json!({"session": "conv-c"})).await;
+    let gone = call(&live, "revoke_session", json!({"session": "conv-c"})).await;
+    assert_eq!(gone["revoked_session"], "conv-c");
+    let err = call_expect_error(
+        &live,
+        "revoke_session",
+        json!({"session": "conv-a-of-marta"}),
+    )
+    .await;
+    assert!(err.contains("no session"), "{err}");
+    assert_eq!(
+        call(&marta, "whoami", json!({})).await["agent"],
+        "marta",
+        "marta's own session is untouched"
+    );
+
+    // The parent's revocation is the session's revocation: no sweep needed.
+    let (parent_id,): (Uuid,) = sqlx::query_as(
+        "SELECT t.id FROM api_tokens t JOIN agents a ON a.id = t.agent_id WHERE a.name = 'joaquin'",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    ai_crew_sync::store::admin::revoke_token(
+        &h.pool,
+        ai_crew_sync::store::admin::Actor::Cli,
+        None,
+        parent_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        mcp_status(&h.base, &resumed_token).await,
+        401,
+        "parent revoked"
+    );
+    assert_eq!(mcp_status(&h.base, &token).await, 401);
+    assert_eq!(
+        mcp_status(&h.base, &other).await,
+        200,
+        "another agent is unaffected"
+    );
+
+    // An expired credential says what to do rather than just failing.
+    let fresh = call(&marta, "register_session", json!({"session": "conv-old"})).await;
+    let fresh_token = fresh["session_token"].as_str().unwrap().to_owned();
+    sqlx::query("UPDATE agent_sessions SET expires_at = now() - interval '1 minute' WHERE label = 'conv-old'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let resp = reqwest::Client::new()
+        .post(format!("{}/mcp", h.base))
+        .header("Authorization", format!("Bearer {fresh_token}"))
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("register_session"),
+        "{body}"
+    );
+
+    for c in [agent, live, marta] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// `tools/list` with a bearer and a session header, for status checks.
+async fn mcp_status_with_session(base: &str, token: &str, session: &str) -> u16 {
+    reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Crew-Session", session)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// `tools/list` with a bearer and an explicit connection epoch.
+async fn mcp_status_with_epoch(base: &str, token: &str, epoch: i64) -> u16 {
+    reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Crew-Epoch", epoch.to_string())
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+// ----------------------------------------------------------- conversations --
+
+/// Turn the capability on for a team, the way an operator does.
+async fn enable_conversations(pool: &PgPool, team: &str) {
+    sqlx::query("UPDATE teams SET conversations_enabled = true WHERE slug = $1")
+        .bind(team)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// A fresh request id for each send; reusing one is how a retry is spotted.
+fn request_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+/// The property the whole feature exists for: two sessions exchange requests
+/// privately, each reader has its own receipt, and the sender can see who
+/// acknowledged and who resolved. Plus the boundaries: the capability flag,
+/// reading not acknowledging, recipients snapshotted at acceptance, and a
+/// non-member seeing nothing.
+#[tokio::test]
+async fn conversations_carry_private_requests_with_per_recipient_receipts() {
+    let h = require_db!("t_conversations");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    let outsider = seed_agent(&h.pool, "other", "eve").await;
+
+    // Off by default: the tools refuse before an operator enables them.
+    let impl_w = connect_with_session(&h.base, &token, "impl").await;
+    let err = call_expect_error(
+        &impl_w,
+        "create_conversation",
+        json!({"title": "too early", "private": true}),
+    )
+    .await;
+    assert!(err.contains("not enabled for this team"), "{err}");
+    enable_conversations(&h.pool, "acme").await;
+
+    // Three windows of two people, plus a reviewer who is never invited.
+    let design = connect_with_session(&h.base, &dani_token, "design").await;
+    let review = connect_with_session(&h.base, &dani_token, "review").await;
+    let bystander = connect_with_session(&h.base, &token, "bystander").await;
+
+    // A private thread addressed to two exact windows.
+    let convo = call(
+        &impl_w,
+        "create_conversation",
+        json!({"title": "the empty state", "private": true,
+               "invite": ["dani/design", "dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    assert_eq!(convo["visibility"], "private");
+    assert_eq!(convo["membership"]["role"], "owner");
+    assert_eq!(convo["members"].as_array().unwrap().len(), 3);
+
+    // An invitation is not membership: until it is accepted, that window is
+    // not a recipient.
+    let first = call(
+        &impl_w,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "what should the empty state say?",
+               "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(first["stored"], true);
+    assert_eq!(first["seq"], 1);
+    assert!(
+        first["recipients"].as_array().unwrap().is_empty(),
+        "nobody has accepted yet: {first}"
+    );
+
+    // Both accept; only the invited window can, not a sibling.
+    let err = call_expect_error(
+        &bystander,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("no invitation for this window"), "{err}");
+    call(
+        &design,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    call(
+        &review,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+
+    let second = call(
+        &impl_w,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "second attempt, with a spinner",
+               "request_id": request_id()}),
+    )
+    .await;
+    let second_id = second["message_id"].as_str().unwrap().to_owned();
+    let mut addressed: Vec<&str> = second["recipients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    addressed.sort();
+    assert_eq!(addressed, vec!["dani/design", "dani/review"]);
+
+    // Reading is not acknowledging.
+    let read = call(
+        &design,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert_eq!(read["messages"].as_array().unwrap().len(), 2);
+    assert!(
+        read["messages"][1]["my_receipt"]["acknowledged_at"].is_null(),
+        "a read must not acknowledge: {read}"
+    );
+    let receipts = call(
+        &impl_w,
+        "get_message_receipts",
+        json!({"message_id": second_id}),
+    )
+    .await;
+    assert_eq!(receipts["total"], 2);
+    assert_eq!(receipts["acknowledged"], 0);
+    assert!(
+        receipts["receipts"][0]["stored_at"].is_string(),
+        "stored is a fact about persistence: {receipts}"
+    );
+    assert!(
+        receipts["receipts"][0]["presented_at"].is_null(),
+        "presentation is unknown, not 'no'"
+    );
+
+    // Independent receipts: one reader acknowledges, the other resolves.
+    call(
+        &design,
+        "ack_message",
+        json!({"message_id": second_id, "note": "looks right"}),
+    )
+    .await;
+    call(
+        &review,
+        "ack_message",
+        json!({"message_id": second_id, "resolved": true, "note": "shipped in 4d21f"}),
+    )
+    .await;
+    let receipts = call(
+        &impl_w,
+        "get_message_receipts",
+        json!({"message_id": second_id}),
+    )
+    .await;
+    assert_eq!(receipts["acknowledged"], 2);
+    assert_eq!(
+        receipts["resolved"], 1,
+        "only one said it acted: {receipts}"
+    );
+    let design_receipt = receipts["receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["address"] == "dani/design")
+        .unwrap();
+    assert!(design_receipt["resolved_at"].is_null());
+    assert_eq!(design_receipt["note"], "looks right");
+
+    // A sender does not acknowledge its own message, and a window that was
+    // not addressed has nothing to acknowledge.
+    let err = call_expect_error(&impl_w, "ack_message", json!({"message_id": second_id})).await;
+    assert!(err.contains("not addressed to your window"), "{err}");
+
+    // Idempotency: the same request id returns the original message.
+    let rid = request_id();
+    let once = call(
+        &impl_w,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "retry me", "request_id": rid}),
+    )
+    .await;
+    let twice = call(
+        &impl_w,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "retry me", "request_id": rid}),
+    )
+    .await;
+    assert_eq!(once["message_id"], twice["message_id"]);
+    assert_eq!(once["seq"], twice["seq"]);
+    let err = call_expect_error(
+        &impl_w,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "something else", "request_id": rid}),
+    )
+    .await;
+    assert!(err.contains("already sent a different message"), "{err}");
+
+    // A late joiner never enters an older message's denominator.
+    call(
+        &impl_w,
+        "invite_to_conversation",
+        json!({"conversation_id": cid, "address": "joaquin/bystander"}),
+    )
+    .await;
+    call(
+        &bystander,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    let receipts = call(
+        &impl_w,
+        "get_message_receipts",
+        json!({"message_id": second_id}),
+    )
+    .await;
+    assert_eq!(
+        receipts["total"], 2,
+        "the denominator is frozen: {receipts}"
+    );
+    // And sees only what was said after they joined.
+    let theirs = call(
+        &bystander,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(
+        theirs["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["body"] != "what should the empty state say?"),
+        "a late member must not read earlier history: {theirs}"
+    );
+
+    // A removal keeps history and receipts, and stops access at once.
+    call(
+        &impl_w,
+        "remove_conversation_member",
+        json!({"conversation_id": cid, "address": "dani/design"}),
+    )
+    .await;
+    let err = call_expect_error(
+        &design,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("no such conversation"), "{err}");
+    let receipts = call(
+        &impl_w,
+        "get_message_receipts",
+        json!({"message_id": second_id}),
+    )
+    .await;
+    assert_eq!(
+        receipts["acknowledged"], 2,
+        "a removal is not a rewrite: {receipts}"
+    );
+
+    // Another team sees nothing, by id or otherwise.
+    let eve = connect(&h.base, &outsider).await;
+    enable_conversations(&h.pool, "other").await;
+    let err = call_expect_error(&eve, "read_conversation", json!({"conversation_id": cid})).await;
+    assert!(err.contains("no such conversation"), "{err}");
+    let theirs = call(&eve, "list_conversations", json!({})).await;
+    assert!(theirs["conversations"].as_array().unwrap().is_empty());
+
+    for c in [impl_w, design, review, bystander, eve] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// The two exceptional paths, and the project boundary. A transfer needs the
+/// target to accept and supersedes rather than rewrites; recovery is
+/// read-only, needs every window of the agent to be gone, and never invents
+/// a receipt. Project access is a grant, not a directory.
+#[tokio::test]
+async fn transfer_needs_acceptance_and_recovery_is_read_only() {
+    let h = require_db!("t_conversations_transfer");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+
+    // A project thread: access is a grant, and a teammate without one sees
+    // nothing even though the thread is not private.
+    let owner = connect_with_session(&h.base, &token, "market-data").await;
+    call(&owner, "create_project", json!({"project": "market-data"})).await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "feed rewrite", "project": "market-data"}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    let first = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "starting on the feed", "request_id": request_id()}),
+    )
+    .await;
+    let first_id = first["message_id"].as_str().unwrap().to_owned();
+
+    let dani = connect_with_session(&h.base, &dani_token, "core").await;
+    let err = call_expect_error(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert!(
+        err.contains("no such conversation"),
+        "a project grant is required: {err}"
+    );
+    call(
+        &owner,
+        "grant_project_access",
+        json!({"project": "market-data", "agent": "dani"}),
+    )
+    .await;
+    let seen = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(seen["messages"].as_array().unwrap().len(), 1, "{seen}");
+    // Project visibility is reading, not membership: there is nothing for a
+    // project reader to acknowledge.
+    let err = call_expect_error(&dani, "ack_message", json!({"message_id": first_id})).await;
+    assert!(err.contains("active member"), "{err}");
+    // And revoking takes effect at once.
+    call(
+        &owner,
+        "grant_project_access",
+        json!({"project": "market-data", "agent": "dani", "grant": false}),
+    )
+    .await;
+    let err = call_expect_error(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert!(err.contains("no such conversation"), "{err}");
+
+    // Transfer: the owner moves its seat to another window of its own agent.
+    let successor = connect_with_session(&h.base, &token, "market-data-2").await;
+    let err = call_expect_error(
+        &owner,
+        "transfer_membership",
+        json!({"conversation_id": cid, "to": "dani/core"}),
+    )
+    .await;
+    assert!(
+        err.contains("same agent"),
+        "a transfer is not an invitation: {err}"
+    );
+
+    let proposal = call(
+        &owner,
+        "transfer_membership",
+        json!({"conversation_id": cid, "to": "joaquin/market-data-2"}),
+    )
+    .await;
+    assert_eq!(proposal["state"], "proposed");
+    // Nothing has moved yet: the original seat is still active and the
+    // successor is only invited.
+    let before = call(&owner, "list_conversations", json!({})).await;
+    let entry = before["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == cid.as_str())
+        .unwrap();
+    assert_eq!(entry["membership"]["state"], "active");
+    assert_eq!(
+        entry["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["address"] == "joaquin/market-data-2")
+            .unwrap()["state"],
+        "invited"
+    );
+
+    call(
+        &successor,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    let after = call(&successor, "list_conversations", json!({})).await;
+    let mine = after["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == cid.as_str())
+        .expect("the successor holds the seat");
+    assert_eq!(
+        mine["membership"]["role"], "owner",
+        "the role travelled: {mine}"
+    );
+    assert_eq!(mine["membership"]["state"], "active");
+    let superseded = mine["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["address"] == "joaquin/market-data")
+        .unwrap();
+    assert_eq!(
+        superseded["state"], "left",
+        "the old seat is superseded: {superseded}"
+    );
+    // Authorship is untouched: the first message is still from the old window.
+    let msg = call(
+        &successor,
+        "get_conversation_message",
+        json!({"message_id": first_id}),
+    )
+    .await;
+    assert_eq!(msg["from_address"], "joaquin/market-data");
+
+    // Recovery: refused while a window is live, refused with a session
+    // credential, and read-only when every window is gone.
+    let cred = call(
+        &owner,
+        "register_session",
+        json!({"session": "market-data"}),
+    )
+    .await;
+    let window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let err = call_expect_error(
+        &window,
+        "recover_conversation_history",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("agent token"), "{err}");
+    let err = call_expect_error(
+        &owner,
+        "recover_conversation_history",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("still live"), "offline is not enough: {err}");
+
+    call(&window, "revoke_session", json!({})).await;
+    let recovered = call(
+        &owner,
+        "recover_conversation_history",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(!recovered["messages"].as_array().unwrap().is_empty());
+    assert!(
+        recovered["messages"][0]["my_receipt"].is_null(),
+        "recovery observes nothing: {recovered}"
+    );
+    // It is audited, and it granted nothing.
+    let (recoveries,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM conversation_audit WHERE action = 'member.recover'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(recoveries, 1);
+
+    for c in [owner, dani, successor] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Three holes the owner reproduced against a real server, and the shape of
+/// their fixes: a window's seat needs that window's credential, a private
+/// thread is not a project thread, and a receipt is not a way around the
+/// history boundary.
+#[tokio::test]
+async fn a_private_thread_answers_only_to_the_windows_that_are_in_it() {
+    let h = require_db!("t_conversation_boundaries");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    let marta_token = seed_agent(&h.pool, "acme", "marta").await;
+    enable_conversations(&h.pool, "acme").await;
+
+    // A registered window: the credential, not the label, is what proves it.
+    let agent = connect(&h.base, &dani_token).await;
+    let cred = call(&agent, "register_session", json!({"session": "review"})).await;
+    let window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "who is in the room", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+
+    // The parent agent token cannot take its own window's seat, even wearing
+    // the right label. It is told what to do instead.
+    let impostor = connect_with_session(&h.base, &dani_token, "review").await;
+    let err = call_expect_error(
+        &impostor,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("registered window"), "{err}");
+    assert!(err.contains("recover_conversation_history"), "{err}");
+
+    // An invitation is not membership, and it does not read what was said
+    // before it was answered.
+    let waiting = call(&window, "list_conversations", json!({})).await;
+    assert!(
+        waiting["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == cid.as_str()),
+        "an invitee can see that it was invited: {waiting}"
+    );
+    let err = call_expect_error(
+        &window,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("join_conversation first"), "{err}");
+
+    call(
+        &window,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    let sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "the private body", "request_id": request_id()}),
+    )
+    .await;
+
+    // Now the seat is held by a window. The same agent token with the same
+    // label is a different caller and sees nothing.
+    let err = call_expect_error(
+        &impostor,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("no such conversation"), "{err}");
+    let err = call_expect_error(
+        &impostor,
+        "get_conversation_message",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(err.contains("no such conversation"), "{err}");
+    // The window itself still reads it.
+    let read = call(
+        &window,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert_eq!(read["messages"][0]["body"], "the private body");
+
+    // Inviting an already active member again does not unbind the seat.
+    // The state is preserved, so the binding must be too, or a repeated
+    // invitation would quietly hand the label back to the parent token.
+    call(
+        &owner,
+        "invite_to_conversation",
+        json!({"conversation_id": cid, "address": "dani/review"}),
+    )
+    .await;
+    let err = call_expect_error(
+        &impostor,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(
+        err.contains("no such conversation"),
+        "a repeated invitation must not downgrade a protected seat: {err}"
+    );
+    let read = call(
+        &window,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert_eq!(
+        read["messages"][0]["body"], "the private body",
+        "and the window still reads it"
+    );
+
+    // Private and project are exclusive, and asking for both is refused
+    // rather than quietly resolved one way.
+    call(&owner, "create_project", json!({"project": "market-data"})).await;
+    let err = call_expect_error(
+        &owner,
+        "create_conversation",
+        json!({"title": "both", "private": true, "project": "market-data"}),
+    )
+    .await;
+    assert!(
+        err.contains("either private or visible to a project"),
+        "{err}"
+    );
+
+    // And a project grant does not reach into a private thread that merely
+    // names the project.
+    call(
+        &owner,
+        "grant_project_access",
+        json!({"project": "market-data", "agent": "marta"}),
+    )
+    .await;
+    let marta = connect_with_session(&h.base, &marta_token, "review").await;
+    sqlx::query(
+        "UPDATE conversations SET project_id = (SELECT id FROM projects WHERE name = 'market-data')
+          WHERE id = $1",
+    )
+    .bind(cid.parse::<Uuid>().unwrap())
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let err = call_expect_error(&marta, "read_conversation", json!({"conversation_id": cid})).await;
+    assert!(
+        err.contains("no such conversation"),
+        "a private thread stays private however it is labelled: {err}"
+    );
+
+    // A late member is refused the earlier message — and its receipts, which
+    // carry recipient addresses and a free-text note that is often the
+    // discussion itself.
+    call(
+        &window,
+        "ack_message",
+        json!({"message_id": sent["message_id"], "resolved": true,
+               "note": "the note is part of the conversation"}),
+    )
+    .await;
+    call(
+        &owner,
+        "invite_to_conversation",
+        json!({"conversation_id": cid, "address": "marta/review"}),
+    )
+    .await;
+    call(&marta, "join_conversation", json!({"conversation_id": cid})).await;
+    let err = call_expect_error(
+        &marta,
+        "get_conversation_message",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(
+        err.contains("before the point your membership starts"),
+        "{err}"
+    );
+    let err = call_expect_error(
+        &marta,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(
+        err.contains("not yours to read either"),
+        "the receipts of a message you may not read are not a way around it: {err}"
+    );
+    // The sender still reads them, of course.
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert_eq!(receipts["acknowledged"], 1);
+
+    // Revoking the window does not hand its label back. Revocation is a way
+    // out, not a way in: the parent token is still refused afterwards, and
+    // the audited recovery path is what an agent has instead.
+    call(&window, "revoke_session", json!({})).await;
+    let err = call_expect_error(
+        &impostor,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("no such conversation"), "{err}");
+    let err = call_expect_error(
+        &impostor,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("registered window"), "{err}");
+    assert!(err.contains("does not hand the label back"), "{err}");
+
+    for c in [owner, window, agent, impostor, marta] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+// -------------------------------------------------- backend and the outbox --
+
+/// The failure shape every external store introduces, exercised with
+/// Postgres as the only backend: acceptance and persistence are two events,
+/// the second can fail, time out, or succeed without the caller hearing.
+/// Leases, fencing, bounded retries, idempotency and reconciliation, with no
+/// broker installed.
+#[tokio::test]
+async fn the_outbox_survives_failures_between_acceptance_and_confirmation() {
+    use ai_crew_sync::store::backend::{Faults, MessagingBackend, PostgresBackend, Published};
+    use ai_crew_sync::store::outbox::{self, Settled};
+
+    let h = require_db!("t_backend_outbox");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let dani = connect_with_session(&h.base, &dani_token, "review").await;
+
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "async thread", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+
+    // Opt this conversation into asynchronous publication. The default is
+    // synchronous and untouched.
+    let cuuid: Uuid = cid.parse().unwrap();
+    outbox::set_publication(&h.pool, cuuid, true).await.unwrap();
+
+    // Acceptance is not storage, and the caller is told so.
+    let rid = request_id();
+    let sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "published later", "request_id": rid}),
+    )
+    .await;
+    assert_eq!(sent["stored"], false, "accepted, not yet stored: {sent}");
+    let mid: Uuid = sent["message_id"].as_str().unwrap().parse().unwrap();
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(
+        receipts["receipts"][0]["stored_at"].is_null(),
+        "stored is not claimed before the backend confirmed: {receipts}"
+    );
+    let status = outbox::status(&h.pool, team_id(&h.pool, "acme").await)
+        .await
+        .unwrap();
+    assert_eq!(status.pending, 1);
+    assert!(status.pending_bytes > 0);
+
+    // A retryable failure backs off and keeps the slot.
+    let flaky = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            retryable: 1,
+            ..Default::default()
+        },
+    );
+    let outcome = outbox::run_once(&h.pool, &flaky, "worker-a").await.unwrap();
+    assert!(
+        matches!(outcome, Some(Settled::Retrying { .. })),
+        "{outcome:?}"
+    );
+    let (state,): (String,) =
+        sqlx::query_as("SELECT publication_state FROM conversation_messages WHERE id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        state, "pending_publication",
+        "a retry does not fabricate stored"
+    );
+
+    // A client retry of the same request_id gets the original's real
+    // state, not a storage confirmation the first call never got.
+    let again = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "published later", "request_id": rid}),
+    )
+    .await;
+    assert_eq!(again["message_id"], sent["message_id"]);
+    assert_eq!(
+        again["stored"], false,
+        "the retry reports what the message is, not what a synchronous send would be"
+    );
+
+    // And a reader is told what it is looking at. The message keeps its
+    // place in the sequence and says it is not stored yet, which is what a
+    // cursor needs to not walk over a gap it never knew about.
+    let page = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    let pending = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["message_id"] == sent["message_id"])
+        .expect("the message is in the thread, not hidden from it");
+    assert_eq!(pending["publication"], "pending_publication");
+    let one = call(
+        &dani,
+        "get_conversation_message",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert_eq!(
+        one["publication"], "pending_publication",
+        "never reported as stored before the backend says so: {one}"
+    );
+
+    // Fencing: a worker whose lease expired settles nothing. Take a lease,
+    // let another worker take it over, then try to settle the stale one.
+    sqlx::query("UPDATE conversation_outbox SET next_attempt_at = now()")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let stale = outbox::lease(&h.pool, "worker-stale")
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE conversation_outbox SET lease_expires_at = now() - interval '1 minute'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let fresh = outbox::lease(&h.pool, "worker-b").await.unwrap().unwrap();
+    assert!(fresh.generation > stale.generation);
+    let fenced = outbox::settle(
+        &h.pool,
+        &stale,
+        Published::Confirmed(ai_crew_sync::store::backend::Locator(mid.to_string())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fenced, Settled::Fenced, "a stale worker must write nothing");
+    let (state,): (String,) =
+        sqlx::query_as("SELECT publication_state FROM conversation_messages WHERE id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "pending_publication");
+
+    // Uncertain completion: the body was written and the confirmation lost.
+    // Reconciliation asks the backend what it actually holds and settles.
+    let losing = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            lose_confirmation: true,
+            ..Default::default()
+        },
+    );
+    let outcome = losing
+        .publish(ai_crew_sync::store::backend::Envelope {
+            message_id: fresh.message_id,
+            conversation_id: fresh.conversation_id,
+            team_id: fresh.team_id,
+            body: fresh.payload.clone(),
+            publish_key: fresh.publish_key,
+        })
+        .await;
+    assert!(matches!(outcome, Published::Retryable(_)));
+    let plain = PostgresBackend::new(h.pool.clone());
+    let settled = outbox::reconcile(&h.pool, &plain, &fresh).await.unwrap();
+    assert_eq!(
+        settled,
+        Settled::Stored,
+        "the write did land; reconcile found it"
+    );
+
+    // Now it is stored, once, and the receipts say when.
+    let (state, locator): (String, Option<String>) = sqlx::query_as(
+        "SELECT publication_state, canonical_locator FROM conversation_messages WHERE id = $1",
+    )
+    .bind(mid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "stored");
+    assert_eq!(locator.as_deref(), Some(mid.to_string().as_str()));
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(
+        receipts["receipts"][0]["stored_at"].is_string(),
+        "{receipts}"
+    );
+    assert!(
+        outbox::lease(&h.pool, "worker-c").await.unwrap().is_none(),
+        "the slot is gone"
+    );
+
+    // Idempotency holds across the async path too: the same request id
+    // returns the original message rather than queueing a second.
+    let rid = request_id();
+    let a = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "twice", "request_id": rid}),
+    )
+    .await;
+    let b = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "twice", "request_id": rid}),
+    )
+    .await;
+    assert_eq!(a["message_id"], b["message_id"]);
+    assert_eq!(a["seq"], b["seq"]);
+    let (slots,): (i64,) = sqlx::query_as("SELECT count(*) FROM conversation_outbox")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(slots, 1, "one logical message, one slot");
+
+    // A fatal failure is explicit and keeps the slot visible, rather than
+    // retrying for ever or pretending it stored.
+    let doomed = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            fatal: true,
+            ..Default::default()
+        },
+    );
+    sqlx::query("UPDATE conversation_outbox SET next_attempt_at = now()")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let outcome = outbox::run_once(&h.pool, &doomed, "worker-d")
+        .await
+        .unwrap();
+    assert_eq!(outcome, Some(Settled::Failed));
+    let team = team_id(&h.pool, "acme").await;
+    let status = outbox::status(&h.pool, team).await.unwrap();
+    assert_eq!(status.failed, 1);
+    assert_eq!(status.pending, 0);
+    let mid2: Uuid = a["message_id"].as_str().unwrap().parse().unwrap();
+    let (state,): (String,) =
+        sqlx::query_as("SELECT publication_state FROM conversation_messages WHERE id = $1")
+            .bind(mid2)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "failed", "an explicit failed slot, not a silent gap");
+
+    // Returning to synchronous mode is refused while work is *outstanding*,
+    // because a thread would keep a gap nobody drains. A failed slot is
+    // settled — explicit, visible, not coming back — so it does not block.
+    let pending = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "still queued", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(pending["stored"], false);
+    let err = outbox::set_publication(&h.pool, cuuid, false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("still awaiting publication"), "{err}");
+    sqlx::query("UPDATE conversation_outbox SET next_attempt_at = now() WHERE state = 'pending'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        outbox::run_once(&h.pool, &plain, "worker-e").await.unwrap(),
+        Some(Settled::Stored)
+    );
+    // The failed slot is still there and still does not block the switch.
+    assert_eq!(outbox::status(&h.pool, team).await.unwrap().failed, 1);
+    outbox::set_publication(&h.pool, cuuid, false)
+        .await
+        .unwrap();
+    let sync_sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "back to sync", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(sync_sent["stored"], true, "the default path is unchanged");
+
+    for c in [owner, dani] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// A message on an asynchronously published thread whose first publication
+/// ended without an answer: its slot is back to pending and the message is
+/// marked uncertain, as `mark_uncertain` leaves it.
+async fn an_uncertain_publication(h: &Harness, team: &str) -> (Client, Uuid) {
+    use ai_crew_sync::store::outbox;
+
+    let token = seed_agent(&h.pool, team, "joaquin").await;
+    enable_conversations(&h.pool, team).await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "async thread", "private": true}),
+    )
+    .await;
+    let cuuid: Uuid = convo["id"].as_str().unwrap().parse().unwrap();
+    outbox::set_publication(&h.pool, cuuid, true).await.unwrap();
+    let sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": convo["id"], "body": "published later",
+               "request_id": request_id()}),
+    )
+    .await;
+    let mid: Uuid = sent["message_id"].as_str().unwrap().parse().unwrap();
+    let lease = outbox::lease(&h.pool, "worker-dead")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.message_id, mid);
+    outbox::mark_uncertain(&h.pool, &lease, "the process died")
+        .await
+        .unwrap();
+    (owner, mid)
+}
+
+/// A publication that settled `failed` stays failed. The reconciler used to
+/// pick every slot whose message was marked uncertain, and a message that
+/// became uncertain and then failed keeps the mark: each pass re-leased the
+/// terminal slot, and once that lease ran out the ordinary worker published
+/// it again (#181).
+#[tokio::test]
+async fn the_reconciler_leaves_a_failed_publication_failed() {
+    use ai_crew_sync::store::backend::{Faults, PostgresBackend};
+    use ai_crew_sync::store::outbox::{self, Settled};
+
+    let h = require_db!("t_reconcile_failed");
+    let (owner, mid) = an_uncertain_publication(&h, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+
+    // The retry is refused for good: the slot and the message are failed.
+    sqlx::query("UPDATE conversation_outbox SET next_attempt_at = now()")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let doomed = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            fatal: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        outbox::run_once(&h.pool, &doomed, "worker-b")
+            .await
+            .unwrap(),
+        Some(Settled::Failed)
+    );
+
+    // A reconcile pass leaves it exactly as it is.
+    let plain = PostgresBackend::new(h.pool.clone());
+    assert_eq!(
+        outbox::resolve_uncertain(&h.pool, &plain, team)
+            .await
+            .unwrap(),
+        0
+    );
+    let (state, holder): (String, Option<String>) =
+        sqlx::query_as("SELECT state, leased_by FROM conversation_outbox WHERE message_id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "failed", "a settled failure was taken again");
+    assert!(holder.is_none(), "held by {holder:?}");
+
+    // And no worker is ever handed it, whatever lease it might carry.
+    sqlx::query(
+        "UPDATE conversation_outbox SET lease_expires_at = now() - interval '1 second'
+          WHERE lease_expires_at IS NOT NULL",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert!(
+        outbox::lease(&h.pool, "worker-c").await.unwrap().is_none(),
+        "a failed publication was handed out to be published again"
+    );
+    let (published,): (String,) =
+        sqlx::query_as("SELECT publication_state FROM conversation_messages WHERE id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(published, "failed");
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
+/// A slot the reconciler takes and the backend does not hold goes straight
+/// back to pending, for the ordinary retry to take at once. It used to stay
+/// leased under the reconciler's name for a whole lease, with the comment
+/// saying it "stays pending" (#181).
+#[tokio::test]
+async fn the_reconciler_puts_back_a_slot_the_backend_does_not_hold() {
+    use ai_crew_sync::store::backend::{Faults, PostgresBackend};
+    use ai_crew_sync::store::outbox;
+
+    let h = require_db!("t_reconcile_unlease");
+    let (owner, mid) = an_uncertain_publication(&h, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let (attempts_before,): (i32,) =
+        sqlx::query_as("SELECT attempts FROM conversation_outbox WHERE message_id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+
+    // A backend that cannot be asked at all: the pass fails, and the slot
+    // it took is put back before the error is returned.
+    let unreachable = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            fail_reconcile: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        outbox::resolve_uncertain(&h.pool, &unreachable, team)
+            .await
+            .is_err()
+    );
+    let (state, holder): (String, Option<String>) =
+        sqlx::query_as("SELECT state, leased_by FROM conversation_outbox WHERE message_id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "pending", "left held by {holder:?} after an error");
+
+    let plain = PostgresBackend::new(h.pool.clone());
+    assert_eq!(
+        outbox::resolve_uncertain(&h.pool, &plain, team)
+            .await
+            .unwrap(),
+        0,
+        "the backend holds nothing for it"
+    );
+    let (state, holder, expires, attempts): (
+        String,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        i32,
+    ) = sqlx::query_as(
+        "SELECT state, leased_by, lease_expires_at, attempts
+           FROM conversation_outbox WHERE message_id = $1",
+    )
+    .bind(mid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "pending", "left held by {holder:?}");
+    assert!(
+        holder.is_none() && expires.is_none(),
+        "{holder:?} {expires:?}"
+    );
+    assert_eq!(attempts, attempts_before, "reconciling is not an attempt");
+    let (uncertain,): (bool,) =
+        sqlx::query_as("SELECT uncertain_at IS NOT NULL FROM conversation_messages WHERE id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(uncertain, "still unknown until a publish answers");
+
+    // Only the backoff `mark_uncertain` set stands between it and a worker.
+    sqlx::query("UPDATE conversation_outbox SET next_attempt_at = now()")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let retried = outbox::lease(&h.pool, "worker-b").await.unwrap();
+    assert_eq!(retried.map(|l| l.message_id), Some(mid));
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
+/// A reconcile that fails reports its own error, even when the slot it
+/// took cannot be put back either: that slot comes back on its own when its
+/// lease runs out, and the operator reads why the pass failed (#183 review).
+#[tokio::test]
+async fn a_reconcile_error_is_not_hidden_by_the_put_back() {
+    use ai_crew_sync::store::backend::{Faults, PostgresBackend};
+    use ai_crew_sync::store::outbox;
+
+    let h = require_db!("t_reconcile_error_kept");
+    let (owner, _mid) = an_uncertain_publication(&h, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+
+    // Putting the slot back fails too.
+    sqlx::query(
+        "CREATE FUNCTION refuse_unlease() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER refuse_unlease BEFORE UPDATE ON conversation_outbox
+         FOR EACH ROW WHEN (OLD.leased_by = 'reconciler' AND NEW.leased_by IS NULL)
+         EXECUTE FUNCTION refuse_unlease()",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let unreachable = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            fail_reconcile: true,
+            ..Default::default()
+        },
+    );
+    let err = outbox::resolve_uncertain(&h.pool, &unreachable, team)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("could not be asked"),
+        "the reconcile error was replaced: {err}"
+    );
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
+/// A send's acknowledgement agrees with the message record and the receipts,
+/// on every path. On an outbox thread a fresh send is accepted before the
+/// backend confirms it: the reply says `stored: false` with
+/// `publication: "pending_publication"`, which is what a read says too, and a
+/// retry with the same `request_id` reports the state the message is in now,
+/// stored or failed, never the snapshot the first call got (#185).
+#[tokio::test]
+async fn a_send_acknowledgement_agrees_with_the_record_and_the_receipts() {
+    use ai_crew_sync::store::backend::{Faults, PostgresBackend};
+    use ai_crew_sync::store::outbox::{self, Settled};
+
+    let h = require_db!("t_send_ack");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let dani = connect_with_session(&h.base, &dani_token, "review").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "acks", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+
+    // What a read and the receipts say about one message.
+    let observed = |mid: String| {
+        let owner = &owner;
+        async move {
+            let msg = call(
+                owner,
+                "get_conversation_message",
+                json!({"message_id": mid}),
+            )
+            .await;
+            let m = msg.get("message").cloned().unwrap_or(msg);
+            let receipts = call(owner, "get_message_receipts", json!({"message_id": mid})).await;
+            (
+                m["publication"].as_str().unwrap_or_default().to_owned(),
+                receipts["receipts"][0]["stored_at"].is_string(),
+            )
+        }
+    };
+    let send = |rid: String, body: &'static str| {
+        let owner = &owner;
+        let cid = cid.clone();
+        async move {
+            call(
+                owner,
+                "send_conversation_message",
+                json!({"conversation_id": cid, "body": body, "request_id": rid}),
+            )
+            .await
+        }
+    };
+
+    // Synchronous: the send's commit is the persistence.
+    let sync = send(request_id(), "sync").await;
+    assert_eq!(sync["stored"], true, "{sync}");
+    assert_eq!(sync["publication"], "stored", "{sync}");
+    let (publication, stored_at) = observed(sync["message_id"].as_str().unwrap().into()).await;
+    assert_eq!((publication.as_str(), stored_at), ("stored", true));
+
+    // Through the outbox: accepted, not yet confirmed, and every surface
+    // says the same.
+    let cuuid: Uuid = cid.parse().unwrap();
+    outbox::set_publication(&h.pool, cuuid, true).await.unwrap();
+    let rid = request_id();
+    let fresh = send(rid.clone(), "published later").await;
+    assert_eq!(fresh["stored"], false, "{fresh}");
+    assert_eq!(fresh["publication"], "pending_publication", "{fresh}");
+    let mid = fresh["message_id"].as_str().unwrap().to_owned();
+    let (publication, stored_at) = observed(mid.clone()).await;
+    assert_eq!(
+        (publication.as_str(), stored_at),
+        ("pending_publication", false)
+    );
+    let again = send(rid.clone(), "published later").await;
+    assert_eq!(again["message_id"], fresh["message_id"]);
+    assert_eq!(again["seq"], fresh["seq"]);
+    assert_eq!(again["publication"], "pending_publication", "{again}");
+
+    // Once the backend confirms it, a retry says so: the state it is in
+    // now, not the one the first call was told.
+    let plain = PostgresBackend::new(h.pool.clone());
+    assert_eq!(
+        outbox::run_once(&h.pool, &plain, "worker").await.unwrap(),
+        Some(Settled::Stored)
+    );
+    let settled = send(rid, "published later").await;
+    assert_eq!(settled["message_id"], fresh["message_id"]);
+    assert_eq!(settled["stored"], true, "{settled}");
+    assert_eq!(settled["publication"], "stored", "{settled}");
+    let (publication, stored_at) = observed(mid).await;
+    assert_eq!((publication.as_str(), stored_at), ("stored", true));
+
+    // A publication that failed is reported as failed, not as pending.
+    let rid = request_id();
+    let doomed_send = send(rid.clone(), "never published").await;
+    assert_eq!(doomed_send["publication"], "pending_publication");
+    let doomed = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            fatal: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        outbox::run_once(&h.pool, &doomed, "worker").await.unwrap(),
+        Some(Settled::Failed)
+    );
+    let failed = send(rid, "never published").await;
+    assert_eq!(failed["stored"], false, "{failed}");
+    assert_eq!(failed["publication"], "failed", "{failed}");
+    let (publication, stored_at) =
+        observed(doomed_send["message_id"].as_str().unwrap().into()).await;
+    assert_eq!((publication.as_str(), stored_at), ("failed", false));
+
+    for c in [owner, dani] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// The team id, for the store-level calls above.
+async fn team_id(pool: &PgPool, slug: &str) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM teams WHERE slug = $1")
+        .bind(slug)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+// -------------------------------------------------- the JetStream adapter --
+
+/// The broker fixture. Required from phase 4: a skipped broker test proves
+/// nothing and reads like a pass, so a missing broker fails visibly.
+fn nats_url() -> String {
+    match std::env::var("TEST_NATS_URL") {
+        Ok(url) if !url.trim().is_empty() => url,
+        _ => panic!(
+            "TEST_NATS_URL is not set. From phase 4 the real JetStream fixture is required: \
+             run `make test`, which starts it, or set TEST_NATS_URL yourself. This is a \
+             failure rather than a skip on purpose."
+        ),
+    }
+}
+
+/// The adapter contract against a real broker: publish and await the PubAck,
+/// read the body back, refuse another team's locator, deduplicate on the
+/// publish key, carry a body at the contract's ceiling, and tell a full
+/// stream apart from a timeout.
+#[tokio::test]
+async fn the_jetstream_adapter_holds_its_contract_against_a_real_broker() {
+    use ai_crew_sync::store::backend::{Envelope, Locator, MessagingBackend, Published};
+    use ai_crew_sync::store::jetstream::{self, Config, JetStreamBackend};
+
+    // Small ceilings: the fixture's broker has a small store, and the
+    // quota behaviour is the same at any size.
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    let team = Uuid::new_v4();
+    let other_team = Uuid::new_v4();
+    let conversation = Uuid::new_v4();
+
+    // Provisioning is an operator action, and the runtime path refuses to
+    // start against a team that has not had it done.
+    let err = match JetStreamBackend::connect(&config, team).await {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("connecting to an unprovisioned team must fail"),
+    };
+    assert!(err.contains("does not exist"), "{err}");
+    assert!(err.contains("Provision it first"), "{err}");
+
+    let stream = JetStreamBackend::provision(&config, team).await.unwrap();
+    assert_eq!(stream.name, jetstream::stream_name(team));
+    assert!(stream.created);
+    JetStreamBackend::provision(&config, other_team)
+        .await
+        .unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+    let theirs = JetStreamBackend::connect(&config, other_team)
+        .await
+        .unwrap();
+
+    // A publish is stored when the PubAck says so, and the locator reads it
+    // back.
+    let key = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let envelope = Envelope {
+        message_id,
+        conversation_id: conversation,
+        team_id: team,
+        body: "the empty state needs a spinner".into(),
+        publish_key: key,
+    };
+    let locator = match backend.publish(envelope.clone()).await {
+        Published::Confirmed(l) => l,
+        other => panic!("expected a PubAck: {other:?}"),
+    };
+    assert!(locator.0.starts_with("jetstream:"), "{locator:?}");
+    assert_eq!(
+        backend
+            .fetch(&locator, message_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("the empty state needs a spinner")
+    );
+
+    // Another team cannot read it even holding the locator. Three
+    // independent reasons and any of them is a pass: the locator names a
+    // stream that is not theirs, that stream would not hold the sequence
+    // anyway, and the envelope's team is checked rather than trusted if it
+    // ever got that far.
+    match theirs.fetch(&locator, message_id).await {
+        Ok(None) => {}
+        Err(e) => {
+            let why = e.to_string();
+            assert!(
+                why.contains("another stream") || why.contains("another team"),
+                "{why}"
+            );
+        }
+        Ok(Some(body)) => panic!("another team read a body it must not see: {body}"),
+    }
+
+    // Idempotency: the same publish key inside the dedup window returns the
+    // same sequence rather than storing twice.
+    let again = match backend.publish(envelope.clone()).await {
+        Published::Confirmed(l) => l,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(again, locator, "a retry must not duplicate the body");
+    // Reconciliation answers the uncertain case without inventing a second
+    // logical message, and without writing a probe that would take the key
+    // the body needs.
+    assert_eq!(
+        backend.reconcile(&envelope).await.unwrap(),
+        Some(locator.clone()),
+        "reconcile must find a key the broker has seen"
+    );
+    // A key it has never seen lands now, under that same key, and answers
+    // with where it went. One logical message, and reconciling twice does
+    // not make it two.
+    let unseen = Envelope {
+        message_id: Uuid::new_v4(),
+        conversation_id: conversation,
+        team_id: team,
+        body: "reconciled into existence".into(),
+        publish_key: Uuid::new_v4(),
+    };
+    let landed = backend.reconcile(&unseen).await.unwrap().unwrap();
+    assert_eq!(
+        backend
+            .fetch(&landed, unseen.message_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("reconciled into existence"),
+        "the locator must name the body, not an empty probe"
+    );
+    assert_eq!(
+        backend.reconcile(&unseen).await.unwrap(),
+        Some(landed),
+        "reconciling twice is still one message"
+    );
+
+    // An envelope for another team is refused rather than written into this
+    // team's stream, where the team it belongs to could never read it.
+    let stranger = backend
+        .publish(Envelope {
+            message_id: Uuid::new_v4(),
+            conversation_id: conversation,
+            team_id: Uuid::new_v4(),
+            body: "not mine".into(),
+            publish_key: Uuid::new_v4(),
+        })
+        .await;
+    assert!(matches!(stranger, Published::Fatal(_)), "{stranger:?}");
+
+    // A locator for a different message of the same team is refused too. A
+    // sequence in the right stream is not proof that it is the right body.
+    let err = backend
+        .fetch(&locator, Uuid::new_v4())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("another message"), "{err}");
+
+    // A locator naming another stream is refused before it reaches the
+    // broker, rather than read as that sequence of this one.
+    let forged = Locator(format!("jetstream:ACS_T_{}:1", Uuid::new_v4().simple()));
+    let err = backend
+        .fetch(&forged, Uuid::new_v4())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("another stream"), "{err}");
+
+    // The 1 MiB body contract still fits once headers and framing are added
+    // — but only because the fixture raises the server's own max_payload as
+    // well as the stream's ceiling. With the server default of 1 MiB this
+    // publish is refused by a couple of hundred bytes of headers, which is
+    // why the Makefile passes --max_payload 2MB and the constant says so.
+    let big = "x".repeat(1024 * 1024);
+    let outcome = backend
+        .publish(Envelope {
+            message_id: Uuid::new_v4(),
+            conversation_id: conversation,
+            team_id: team,
+            body: big.clone(),
+            publish_key: Uuid::new_v4(),
+        })
+        .await;
+    assert!(
+        matches!(outcome, Published::Confirmed(_)),
+        "a body at the contract's ceiling must fit: {outcome:?}"
+    );
+    // And one past the broker's limit is fatal, not retried for ever.
+    let too_big = "x".repeat(jetstream::MAX_BROKER_MESSAGE_BYTES as usize + 1);
+    let outcome = backend
+        .publish(Envelope {
+            message_id: Uuid::new_v4(),
+            conversation_id: conversation,
+            team_id: team,
+            body: too_big,
+            publish_key: Uuid::new_v4(),
+        })
+        .await;
+    assert!(matches!(outcome, Published::Fatal(_)), "{outcome:?}");
+
+    // A sequence this stream does not hold is absent, not an error. A
+    // locator naming another stream, or no stream at all, is refused rather
+    // than guessed at.
+    assert!(
+        backend
+            .fetch(
+                &Locator(format!("jetstream:{}:999999", backend.stream())),
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backend
+            .fetch(&Locator("jetstream:ACS_T_x:1".into()), Uuid::new_v4())
+            .await
+            .is_err()
+    );
+    assert!(
+        backend
+            .fetch(&Locator("nonsense".into()), Uuid::new_v4())
+            .await
+            .is_err()
+    );
+
+    // A broker that is not there fails retryably rather than hanging.
+    let unreachable = Config::new("nats://127.0.0.1:1");
+    assert!(
+        JetStreamBackend::connect(&unreachable, team).await.is_err(),
+        "an unreachable broker must fail, not block"
+    );
+
+    // Clean up after ourselves: streams and their bodies are per test.
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    JetStreamBackend::deprovision(&config, other_team)
+        .await
+        .unwrap();
+}
+
+/// The default install does not need a broker: an ordinary team's
+/// conversations are Postgres-backed and untouched by anything above.
+#[tokio::test]
+async fn the_default_backend_stays_postgres_with_no_broker_involved() {
+    let h = require_db!("t_default_backend");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    enable_conversations(&h.pool, "acme").await;
+    let client = connect_with_session(&h.base, &token, "impl").await;
+    let convo = call(
+        &client,
+        "create_conversation",
+        json!({"title": "ordinary", "private": true}),
+    )
+    .await;
+    let (backend, publication): (String, String) =
+        sqlx::query_as("SELECT backend, publication FROM conversations WHERE id = $1")
+            .bind(convo["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(backend, "postgres");
+    assert_eq!(publication, "sync");
+    let sent = call(
+        &client,
+        "send_conversation_message",
+        json!({"conversation_id": convo["id"], "body": "no broker here",
+               "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(sent["stored"], true);
+    let _ = client.cancel().await;
+    h.shutdown().await;
+}
+
+/// Phase 5: a conversation routed to JetStream publishes through the outbox
+/// to a real broker, reports `stored` only on a PubAck, survives a process
+/// death mid-publication, reads its history back by locator, and revalidates
+/// access at the moment the body is served.
+#[tokio::test]
+async fn opted_in_conversations_publish_to_jetstream_and_read_back() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::{conversations as convo_store, outbox};
+
+    let h = require_db_broker!("t_jetstream_publication");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+
+    // Routing is an operator decision, per team, and it only affects
+    // conversations created afterwards.
+    let before = connect_with_session(&h.base, &token, "before").await;
+    let legacy = call(
+        &before,
+        "create_conversation",
+        json!({"title": "postgres thread", "private": true}),
+    )
+    .await;
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+    // The same view of the backends the server has, for the reads this test
+    // makes directly against the store.
+    let backends =
+        ai_crew_sync::store::routing::Backends::with_jetstream(h.pool.clone(), config.clone());
+
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let dani = connect_with_session(&h.base, &dani_token, "review").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "jetstream thread", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    let cuuid: Uuid = cid.parse().unwrap();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+
+    // The earlier conversation kept Postgres; the new one is routed.
+    let (old_backend,): (String,) =
+        sqlx::query_as("SELECT backend FROM conversations WHERE id = $1")
+            .bind(legacy["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(old_backend, "postgres", "existing threads are not migrated");
+    let (new_backend, publication): (String, String) =
+        sqlx::query_as("SELECT backend, publication FROM conversations WHERE id = $1")
+            .bind(cuuid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (new_backend.as_str(), publication.as_str()),
+        ("jetstream", "outbox")
+    );
+
+    // Acceptance is not storage, and the receipts do not claim it is.
+    let sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "through the broker",
+               "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(sent["stored"], false);
+    let mid: Uuid = sent["message_id"].as_str().unwrap().parse().unwrap();
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(receipts["receipts"][0]["stored_at"].is_null(), "{receipts}");
+
+    // A worker dies mid-publication: the outcome is unknown, and that is
+    // neither stored nor failed until reconciliation says so.
+    let lease = outbox::lease(&h.pool, "worker-dead")
+        .await
+        .unwrap()
+        .unwrap();
+    let settled = outbox::mark_uncertain(&h.pool, &lease, "the process died")
+        .await
+        .unwrap();
+    assert!(matches!(settled, outbox::Settled::Retrying { .. }));
+    let (state, uncertain): (String, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "SELECT publication_state, uncertain_at FROM conversation_messages WHERE id = $1",
+    )
+    .bind(mid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "pending_publication");
+    assert!(
+        uncertain.is_some(),
+        "an unknown outcome is recorded as unknown"
+    );
+
+    // Reconciliation asks the broker under the same key instead of
+    // guessing: inside its dedup window that answers with the original
+    // sequence, outside it the body lands now. One logical message either
+    // way, and only now is it stored.
+    assert_eq!(
+        outbox::resolve_uncertain(&h.pool, &backend, team)
+            .await
+            .unwrap(),
+        1
+    );
+    let (uncertain,): (Option<chrono::DateTime<chrono::Utc>>,) =
+        sqlx::query_as("SELECT uncertain_at FROM conversation_messages WHERE id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(
+        uncertain.is_none(),
+        "an answered question is no longer open"
+    );
+    let (state, locator): (String, Option<String>) = sqlx::query_as(
+        "SELECT publication_state, canonical_locator FROM conversation_messages WHERE id = $1",
+    )
+    .bind(mid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "stored");
+    assert!(
+        locator.as_deref().unwrap().starts_with("jetstream:"),
+        "{locator:?}"
+    );
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(
+        receipts["receipts"][0]["stored_at"].is_string(),
+        "stored once the PubAck arrived, not before: {receipts}"
+    );
+
+    // History reads through the ordinary tool, from the broker, with the
+    // body's standing stated rather than implied.
+    let history = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(history["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(history["messages"][0]["publication"], "stored");
+
+    // The temporary local copy is released, and history then reads from the
+    // broker by locator.
+    assert_eq!(
+        outbox::release_published_bodies(
+            &h.pool,
+            &ai_crew_sync::store::routing::Backends::with_jetstream(h.pool.clone(), config.clone()),
+            Some(cuuid),
+            0
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let (local,): (String,) =
+        sqlx::query_as("SELECT body FROM conversation_messages WHERE id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(local.is_empty(), "the body is the broker's now");
+    assert_eq!(
+        convo_store::body_of(&h.pool, &backends, mid).await.unwrap(),
+        "through the broker"
+    );
+
+    // One logical message, not two, and its body came from the broker.
+    let history = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(
+        history["messages"].as_array().unwrap().len(),
+        1,
+        "a retained body is one message, not a second copy: {history}"
+    );
+    assert_eq!(history["messages"][0]["body"], "through the broker");
+
+    // A pending publication is neither hidden nor reported as stored, and
+    // an earlier pending message does not let a reader walk past it.
+    let pending = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "still in flight",
+               "request_id": request_id()}),
+    )
+    .await;
+    let _later = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "sent after it",
+               "request_id": request_id()}),
+    )
+    .await;
+    let history = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    let msgs = history["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 3);
+    assert_eq!(msgs[1]["publication"], "pending_publication");
+    assert_eq!(
+        msgs[1]["body"], "still in flight",
+        "the body is still local"
+    );
+    assert!(msgs[1]["seq"].as_i64().unwrap() < msgs[2]["seq"].as_i64().unwrap());
+    // And the cursor stops before it. Following the advertised
+    // next_after_seq must not step over a sequence that is about to fill.
+    let pending_seq = msgs[1]["seq"].as_i64().unwrap();
+    let paged = call(
+        &dani,
+        "read_conversation",
+        json!({"conversation_id": cid, "limit": 2}),
+    )
+    .await;
+    assert!(
+        paged["next_after_seq"]
+            .as_i64()
+            .is_none_or(|n| n < pending_seq),
+        "the cursor advanced past a message still in flight: {paged}"
+    );
+
+    // Out-of-order completion: the later message is published first. The
+    // thread keeps its own order, which is the sequence, not the order the
+    // broker happened to confirm in.
+    let first = outbox::lease(&h.pool, "worker-a").await.unwrap().unwrap();
+    let second = outbox::lease(&h.pool, "worker-b").await.unwrap().unwrap();
+    assert_eq!(first.message_id.to_string(), pending["message_id"]);
+    assert_eq!(
+        outbox::publish_leased(&h.pool, &backend, &second)
+            .await
+            .unwrap(),
+        outbox::Settled::Stored
+    );
+    assert_eq!(
+        outbox::publish_leased(&h.pool, &backend, &first)
+            .await
+            .unwrap(),
+        outbox::Settled::Stored
+    );
+    outbox::release_published_bodies(
+        &h.pool,
+        &ai_crew_sync::store::routing::Backends::with_jetstream(h.pool.clone(), config.clone()),
+        Some(cuuid),
+        0,
+    )
+    .await
+    .unwrap();
+    let history = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    let bodies: Vec<&str> = history["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        bodies,
+        ["through the broker", "still in flight", "sent after it"],
+        "confirmation order is not thread order"
+    );
+
+    // An ACL that changes while bodies are on the broker takes effect on
+    // the next read, not the next restart: a removed member stops reading.
+    call(
+        &owner,
+        "remove_conversation_member",
+        json!({"conversation_id": cid, "address": "dani/review"}),
+    )
+    .await;
+    let refused =
+        call_expect_error(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert!(refused.contains("no such conversation"), "{refused}");
+    let refused = call_expect_error(
+        &dani,
+        "get_conversation_message",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(refused.contains("no such conversation"), "{refused}");
+
+    // A body the backend no longer holds is an explained absence, and the
+    // message keeps its place, its recipients and its receipts.
+    outbox::tombstone(&h.pool, mid, "retention").await.unwrap();
+    let err = convo_store::body_of(&h.pool, &backends, mid)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no longer held"), "{err}");
+    assert!(err.contains("receipts remain"), "{err}");
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert_eq!(receipts["total"], 1, "the denominator survives a tombstone");
+    let history = call(&owner, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(history["messages"][0]["publication"], "tombstoned");
+    assert_eq!(history["messages"][0]["body"], "");
+    assert!(
+        history["messages"][0]["unavailable"]
+            .as_str()
+            .unwrap()
+            .contains("no longer held"),
+        "a gap that is explained is not the same as a gap: {history}"
+    );
+    assert_eq!(
+        history["messages"].as_array().unwrap().len(),
+        3,
+        "a tombstoned body does not remove the message"
+    );
+
+    // The Postgres thread is untouched by any of this.
+    let legacy_sent = call(
+        &before,
+        "send_conversation_message",
+        json!({"conversation_id": legacy["id"], "body": "still local",
+               "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(legacy_sent["stored"], true);
+    assert_eq!(
+        convo_store::body_of(
+            &h.pool,
+            &backends,
+            legacy_sent["message_id"].as_str().unwrap().parse().unwrap()
+        )
+        .await
+        .unwrap(),
+        "still local"
+    );
+
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    for c in [owner, dani, before] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Phase 6: every recipient has its own durable inbox. One acknowledgement
+/// drains nobody else's, a process that dies between taking a reference and
+/// confirming it gets an honest state rather than a fabricated receipt, and
+/// a broker that has lost the references does not make the inbox look empty.
+#[tokio::test]
+async fn each_recipient_holds_its_own_durable_inbox() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::{inbox, outbox};
+
+    let h = require_db_broker!("t_inbox_delivery");
+    let owner_token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    let marta_token = seed_agent(&h.pool, "acme", "marta").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    JetStreamBackend::provision_inbox(&config, team)
+        .await
+        .unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+
+    let owner = connect_with_session(&h.base, &owner_token, "impl").await;
+    let design = connect_with_session(&h.base, &dani_token, "design").await;
+    let marta = connect_with_session(&h.base, &marta_token, "review").await;
+    // One of the three is a registered window, so the inbox is exercised
+    // with a real session credential and not only with a header label.
+    let dani_agent = connect(&h.base, &dani_token).await;
+    let review_cred = call(
+        &dani_agent,
+        "register_session",
+        json!({"session": "review"}),
+    )
+    .await;
+    let review = connect(&h.base, review_cred["session_token"].as_str().unwrap()).await;
+
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "three inboxes", "private": true,
+               "invite": ["dani/review", "dani/design", "marta/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    for client in [&review, &design, &marta] {
+        call(client, "join_conversation", json!({"conversation_id": cid})).await;
+    }
+    let sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "three of you, three inboxes",
+               "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(sent["recipients"].as_array().unwrap().len(), 3);
+
+    // Nothing is notified before the body is canonical: a reference to a
+    // message nobody stored would be a promise of something unreadable.
+    assert_eq!(
+        inbox::publish_pending(&h.pool, &backend, team, 100)
+            .await
+            .unwrap(),
+        0,
+        "no references before the body is stored"
+    );
+    assert_eq!(
+        outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+        Some(outbox::Settled::Stored)
+    );
+    assert_eq!(
+        inbox::publish_pending(&h.pool, &backend, team, 100)
+            .await
+            .unwrap(),
+        3,
+        "one reference per recipient, and no more"
+    );
+
+    // Each window takes its own, and only its own.
+    let first = call(&review, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(first["references"].as_array().unwrap().len(), 1);
+    assert_eq!(first["from_broker"], 1);
+    assert_eq!(first["references"][0]["message_id"], sent["message_id"]);
+    assert_eq!(first["references"][0]["kind"], "message");
+    assert_eq!(first["references"][0]["redelivered"], false);
+    assert!(
+        first["references"][0].get("body").is_none(),
+        "a reference carries no body: {first}"
+    );
+
+    // Taking it is not receiving it. Until the holder says it has it
+    // durably, nothing is delivered.
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(
+        receipts["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["delivered_at"].is_null()),
+        "{receipts}"
+    );
+
+    call(
+        &review,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [first["references"][0]["delivery_id"]]}),
+    )
+    .await;
+    let delivered = |receipts: &Value, address: &str| -> bool {
+        receipts["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["address"] == address)
+            .map(|r| r["delivered_at"].is_string())
+            .unwrap_or(false)
+    };
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(delivered(&receipts, "dani/review"), "{receipts}");
+    assert!(!delivered(&receipts, "dani/design"), "{receipts}");
+    assert!(!delivered(&receipts, "marta/review"), "{receipts}");
+
+    // One window's acknowledgement is its own. The other two are not
+    // "assumed yes" and not "no": they have not answered.
+    call(
+        &review,
+        "ack_message",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert_eq!(receipts["acknowledged"], 1);
+    assert_eq!(receipts["resolved"], 0);
+    assert_eq!(receipts["total"], 3);
+
+    // The parent agent token cannot read its own window's inbox, or record
+    // a delivery on its behalf. The label in the header is a name.
+    let impostor = connect_with_session(&h.base, &dani_token, "review").await;
+    let err = call_expect_error(&impostor, "fetch_conversation_inbox", json!({})).await;
+    assert!(err.contains("registered window"), "{err}");
+    let err = call_expect_error(
+        &impostor,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [first["references"][0]["delivery_id"]]}),
+    )
+    .await;
+    assert!(err.contains("registered window"), "{err}");
+    let err = call_expect_error(&impostor, "conversation_inbox_status", json!({})).await;
+    assert!(err.contains("registered window"), "{err}");
+
+    // A later observation on the same message is a new notification. The
+    // sender is told to look again when the recipient resolves it, not only
+    // the first time it acknowledged.
+    inbox::publish_pending(&h.pool, &backend, team, 100)
+        .await
+        .unwrap();
+    call(
+        &review,
+        "ack_message",
+        json!({"message_id": sent["message_id"], "resolved": true, "note": "and done"}),
+    )
+    .await;
+    assert_eq!(
+        inbox::publish_pending(&h.pool, &backend, team, 100)
+            .await
+            .unwrap(),
+        1,
+        "resolving after acknowledging is a second thing to tell the sender"
+    );
+    let (events,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM inbox_events WHERE kind = 'receipt' AND message_id = $1",
+    )
+    .bind(
+        sent["message_id"]
+            .as_str()
+            .unwrap()
+            .parse::<Uuid>()
+            .unwrap(),
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        events, 2,
+        "acknowledged and resolved are two observations, not one coalesced row"
+    );
+
+    // And revoking the window does not open its inbox either. The label was
+    // registered once, which is enough: revocation must not turn a
+    // protected window into a legacy identity.
+    call(&review, "revoke_session", json!({})).await;
+    let err = call_expect_error(&impostor, "fetch_conversation_inbox", json!({})).await;
+    assert!(err.contains("does not hand the label back"), "{err}");
+    let err = call_expect_error(
+        &impostor,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [first["references"][0]["delivery_id"]]}),
+    )
+    .await;
+    assert!(err.contains("registered window"), "{err}");
+
+    // A process that takes a reference and dies before confirming: the
+    // reference is not lost and no receipt is invented. A second fetch does
+    // not hand it over twice while the first hand-out is still in flight,
+    // and the state says exactly that.
+    let taken = call(&design, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(taken["references"].as_array().unwrap().len(), 1);
+    let again = call(&design, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(
+        again["references"].as_array().unwrap().len(),
+        0,
+        "it is already in flight to this window: {again}"
+    );
+    let state = call(&design, "conversation_inbox_status", json!({})).await;
+    assert_eq!(state["address"], "dani/design");
+    assert_eq!(state["undelivered"], 1, "the authority still says one");
+    assert_eq!(state["handed_out_unconfirmed"], 1);
+
+    // Offered again once that hand-out has gone stale, it is the same
+    // reference under the same delivery id. A second row for the same
+    // reference used to violate the unique index and fail the whole fetch.
+    sqlx::query("UPDATE inbox_deliveries SET handed_at = now() - interval '10 minutes'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let redelivered = call(&design, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(redelivered["references"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        redelivered["references"][0]["delivery_id"], taken["references"][0]["delivery_id"],
+        "a redelivery finds the hand-out that is already open: {redelivered}"
+    );
+    // The confirmation arrives after the restart, with the reference the
+    // spool kept. Confirming twice changes nothing.
+    let id = taken["references"][0]["delivery_id"].clone();
+    let confirmed = call(
+        &design,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [id]}),
+    )
+    .await;
+    assert_eq!(confirmed["confirmed"], 1);
+    let repeat = call(
+        &design,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [id]}),
+    )
+    .await;
+    assert_eq!(repeat["confirmed"], 0, "confirming twice is harmless");
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(delivered(&receipts, "dani/design"), "{receipts}");
+    assert!(!delivered(&receipts, "marta/review"));
+
+    // A confirmation from a window that has since been resumed away writes
+    // nothing: the reference stays offered to whoever holds the window now.
+    // This needs a registered window, because that is what an epoch is.
+    let cred = call(&marta, "register_session", json!({"session": "review"})).await;
+    let marta_window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let stale = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'marta'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "marta".into(),
+        team_id: team,
+        team_slug: "acme".into(),
+        session: "review".into(),
+        session_id: sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM agent_sessions WHERE label = 'review' AND agent_id =
+                 (SELECT id FROM agents WHERE name = 'marta')",
+        )
+        .fetch_optional(&h.pool)
+        .await
+        .unwrap(),
+        // The epoch a connection that has since been replaced was admitted
+        // with.
+        session_epoch: Some(99),
+        token_id: None,
+    };
+    assert!(stale.session_id.is_some(), "the window must be registered");
+    let backends =
+        ai_crew_sync::store::routing::Backends::with_jetstream(h.pool.clone(), config.clone());
+    let marta_batch = call(&marta_window, "fetch_conversation_inbox", json!({})).await;
+    let marta_id = marta_batch["references"][0]["delivery_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let err = inbox::confirm(&h.pool, &backends, &stale, std::slice::from_ref(&marta_id))
+        .await
+        .expect_err("a replaced connection must not confirm")
+        .to_string();
+    assert!(err.contains("stale"), "{err}");
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(
+        !delivered(&receipts, "marta/review"),
+        "a fenced confirmation must not write a receipt: {receipts}"
+    );
+
+    // The broker loses everything — an expiry, an operator, a deleted
+    // consumer. The inbox is not empty: the bus's own records are the
+    // authority, and the reference comes back from there.
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    // Immediately after a hand-out the reference is in flight to this
+    // window, and a fetch does not hand it over a second time. The state is
+    // the honest answer, and it is not "your inbox is empty".
+    let inflight = call(&marta_window, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(inflight["references"].as_array().unwrap().len(), 0);
+    let state = call(&marta_window, "conversation_inbox_status", json!({})).await;
+    assert_eq!(state["undelivered"], 1);
+    assert_eq!(state["handed_out_unconfirmed"], 1);
+    assert_eq!(
+        state["broker_consumer_present"], false,
+        "a missing consumer is a fact, not an empty inbox: {state}"
+    );
+
+    // Once that hand-out has gone stale — the process holding it never came
+    // back — the reference is offered again, from the records that are the
+    // authority.
+    sqlx::query("UPDATE inbox_deliveries SET handed_at = now() - interval '10 minutes'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let rebuilt = call(
+        &marta_window,
+        "fetch_conversation_inbox",
+        json!({"limit": 5}),
+    )
+    .await;
+    let refs = rebuilt["references"].as_array().unwrap();
+    assert_eq!(refs.len(), 1, "{rebuilt}");
+    assert_eq!(refs[0]["source"], "bus");
+    assert_eq!(rebuilt["from_broker"], 0);
+    assert!(
+        rebuilt["note"].as_str().unwrap().contains("authority"),
+        "{rebuilt}"
+    );
+    call(
+        &marta_window,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [refs[0]["delivery_id"]]}),
+    )
+    .await;
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(delivered(&receipts, "marta/review"), "{receipts}");
+    assert_eq!(
+        receipts["acknowledged"], 1,
+        "delivery is not acknowledgement, on any path"
+    );
+
+    // Legacy traffic is untouched by all of this.
+    call(&owner, "create_channel", json!({"name": "general"})).await;
+    call(
+        &owner,
+        "post_message",
+        json!({"channel": "general", "body": "still here"}),
+    )
+    .await;
+    let read = call(
+        &marta_window,
+        "read_messages",
+        json!({"channel": "general"}),
+    )
+    .await;
+    assert_eq!(read["messages"].as_array().unwrap().len(), 1);
+
+    for c in [
+        owner,
+        review,
+        design,
+        marta,
+        marta_window,
+        dani_agent,
+        impostor,
+    ] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Phase 7: a supervised move, a rollback, and an interrupted run that
+/// resumes. Bodies, ids, authorship, access and every observed receipt come
+/// through unchanged, and nothing is cut over until every body has been read
+/// back from the target and matched.
+#[tokio::test]
+async fn a_conversation_moves_between_backends_and_back_without_losing_anything() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::migrate::{self, Direction};
+    use ai_crew_sync::store::outbox;
+
+    let h = require_db_broker!("t_conversation_migration");
+    let owner_token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    JetStreamBackend::provision_inbox(&config, team)
+        .await
+        .unwrap();
+    let jetstream = JetStreamBackend::connect(&config, team).await.unwrap();
+
+    // A thread that lives entirely in Postgres, with real receipts on it.
+    let owner = connect_with_session(&h.base, &owner_token, "impl").await;
+    let dani = connect_with_session(&h.base, &dani_token, "review").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "moved thread", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    let cuuid: Uuid = cid.parse().unwrap();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+    let mut sent = Vec::new();
+    for body in ["the first one", "the second one", "the third one"] {
+        sent.push(
+            call(
+                &owner,
+                "send_conversation_message",
+                json!({"conversation_id": cid, "body": body, "request_id": request_id()}),
+            )
+            .await,
+        );
+    }
+    call(
+        &dani,
+        "ack_message",
+        json!({"message_id": sent[1]["message_id"], "resolved": true, "note": "done"}),
+    )
+    .await;
+    let before = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    let receipts_before = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent[1]["message_id"]}),
+    )
+    .await;
+
+    // A plan changes nothing and says what it would cost.
+    let plans = migrate::plan(&h.pool, team, Direction::ToJetStream, &[cuuid])
+        .await
+        .unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].messages, 3);
+    assert_eq!(plans[0].current_backend, "postgres");
+    assert!(plans[0].blocked.is_none());
+    assert!(plans[0].bytes > 0);
+    let unchanged = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(
+        unchanged["messages"], before["messages"],
+        "a plan is a read"
+    );
+
+    // The move itself.
+    let outcome = migrate::run(&h.pool, &jetstream, team, cuuid, Direction::ToJetStream)
+        .await
+        .unwrap();
+    assert_eq!(outcome.copied, 3);
+    assert_eq!(outcome.state, "cut_over");
+
+    // Writes are open again, and the thread reads exactly as it did — same
+    // ids, same order, same bodies, same authors.
+    let after = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(
+        after["messages"], before["messages"],
+        "the thread is the thread"
+    );
+    let receipts_after = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent[1]["message_id"]}),
+    )
+    .await;
+    assert_eq!(
+        receipts_after, receipts_before,
+        "a move observes nothing and invents nothing"
+    );
+    let (backend, locators): (String, i64) = sqlx::query_as(
+        "SELECT (SELECT backend FROM conversations WHERE id = $1),
+                count(*) FILTER (WHERE canonical_locator IS NOT NULL)
+           FROM conversation_messages WHERE conversation_id = $1",
+    )
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!((backend.as_str(), locators), ("jetstream", 3));
+
+    // The source bodies are still there: until cleanup runs, a rollback has
+    // something to roll back to.
+    let (still_local,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM conversation_messages WHERE conversation_id = $1 AND body <> ''",
+    )
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(still_local, 3);
+    let (would_drop, _bytes) = migrate::cleanup(&h.pool, team, 168, false).await.unwrap();
+    assert_eq!(
+        would_drop, 0,
+        "nothing is dropped inside the rollback window"
+    );
+    assert!(
+        migrate::cleanup(&h.pool, team, -1, false).await.is_err(),
+        "a negative window would point into the future"
+    );
+
+    // And the ordinary publication sweep leaves them alone. It releases
+    // bodies the outbox staged; a migration source copy is the rollback,
+    // and only `conversations cleanup` may drop it.
+    assert_eq!(
+        outbox::release_published_bodies(
+            &h.pool,
+            &ai_crew_sync::store::routing::Backends::with_jetstream(h.pool.clone(), config.clone()),
+            None,
+            0
+        )
+        .await
+        .unwrap(),
+        0,
+        "the five minute sweep must not eat the rollback source"
+    );
+    let (still_local,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM conversation_messages WHERE conversation_id = $1 AND body <> ''",
+    )
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(still_local, 3);
+
+    // An interrupted run resumes through the same command. The process
+    // died holding the pause, and the plan says so instead of skipping the
+    // thread and reporting success.
+    sqlx::query("UPDATE conversations SET write_paused_at = now() WHERE id = $1")
+        .bind(cuuid)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ($1, $2, 'to_jetstream', 'copying')",
+    )
+    .bind(team)
+    .bind(cuuid)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let plans = migrate::plan(&h.pool, team, Direction::ToJetStream, &[cuuid])
+        .await
+        .unwrap();
+    assert!(plans[0].blocked.is_none(), "{:?}", plans[0].blocked);
+    assert!(plans[0].resuming, "an open run is resumed, not refused");
+    let resumed = migrate::run(&h.pool, &jetstream, team, cuuid, Direction::ToJetStream)
+        .await
+        .unwrap();
+    assert_eq!(resumed.state, "cut_over");
+    let (paused,): (Option<chrono::DateTime<chrono::Utc>>,) =
+        sqlx::query_as("SELECT write_paused_at FROM conversations WHERE id = $1")
+            .bind(cuuid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(paused.is_none(), "resuming finishes and reopens the thread");
+
+    // New messages go where the thread now lives, and are published like
+    // any other: acceptance is not storage.
+    let fresh = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "written after the move",
+               "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(fresh["stored"], false);
+    assert_eq!(
+        outbox::run_once(&h.pool, &jetstream, "worker")
+            .await
+            .unwrap(),
+        Some(outbox::Settled::Stored)
+    );
+
+    // An interrupted run resumes instead of copying twice. Half the
+    // evidence is thrown away and the same move is run again.
+    outbox::release_published_bodies(
+        &h.pool,
+        &ai_crew_sync::store::routing::Backends::with_jetstream(h.pool.clone(), config.clone()),
+        Some(cuuid),
+        0,
+    )
+    .await
+    .unwrap();
+    let back = migrate::run(&h.pool, &jetstream, team, cuuid, Direction::ToPostgres)
+        .await
+        .unwrap();
+    assert_eq!(back.copied, 4, "every body came back off the broker");
+    let (backend,): (String,) = sqlx::query_as("SELECT backend FROM conversations WHERE id = $1")
+        .bind(cuuid)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(backend, "postgres");
+    let rolled = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    let bodies: Vec<&str> = rolled["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        bodies,
+        [
+            "the first one",
+            "the second one",
+            "the third one",
+            "written after the move"
+        ],
+        "a rollback is a copy back, and it keeps what was written meanwhile"
+    );
+    let receipts_rolled = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent[1]["message_id"]}),
+    )
+    .await;
+    assert_eq!(
+        receipts_rolled, receipts_before,
+        "receipts survive both ways"
+    );
+
+    // A second move, interrupted after two messages and resumed: the run
+    // picks up its own evidence rather than starting over.
+    let migration = migrate::run(&h.pool, &jetstream, team, cuuid, Direction::ToJetStream)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE conversation_migrations SET state = 'copying', finished_at = NULL WHERE id = $1",
+    )
+    .bind(migration.migration_id)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "DELETE FROM conversation_migration_items
+          WHERE migration_id = $1 AND message_id IN (
+              SELECT id FROM conversation_messages WHERE conversation_id = $2
+               ORDER BY seq LIMIT 2)",
+    )
+    .bind(migration.migration_id)
+    .bind(cuuid)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE conversation_messages SET backend = 'postgres'
+          WHERE conversation_id = $1 AND seq <= 2",
+    )
+    .bind(cuuid)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let resumed = migrate::run(&h.pool, &jetstream, team, cuuid, Direction::ToJetStream)
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed.migration_id, migration.migration_id,
+        "the same run continued"
+    );
+    assert_eq!(resumed.copied, 2, "only what was missing was copied again");
+    assert_eq!(resumed.skipped, 2, "what was verified was left alone");
+    let final_read = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(
+        final_read["messages"].as_array().unwrap().len(),
+        4,
+        "one logical message each, however many times they were copied"
+    );
+
+    // Writes are never left paused, whichever way it went.
+    let (paused,): (Option<chrono::DateTime<chrono::Utc>>,) =
+        sqlx::query_as("SELECT write_paused_at FROM conversations WHERE id = $1")
+            .bind(cuuid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(paused.is_none());
+
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    for c in [owner, dani] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// A move whose abort cannot finish stays open and resumable. `abort` used
+/// to mark the run failed, blank the written-back bodies and lift the pause
+/// as three separate writes, so a failure after the first left the thread
+/// paused with no run behind the pause: every send refused, and the same
+/// command refused too because no move owned the pause (#180).
+#[tokio::test]
+async fn an_abort_that_cannot_finish_leaves_its_move_resumable() {
+    use ai_crew_sync::store::migrate::{self, Direction};
+
+    let h = require_db!("t_abort_atomic");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "moving thread", "private": true}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    let cuuid: Uuid = cid.parse().unwrap();
+
+    // A move in flight: the thread paused under an open run, as `run`
+    // leaves it while it copies.
+    sqlx::query("UPDATE conversations SET write_paused_at = now() WHERE id = $1")
+        .bind(cuuid)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (migration,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ($1, $2, 'to_jetstream', 'copying') RETURNING id",
+    )
+    .bind(team)
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let refused = call_expect_error(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "during the move", "request_id": request_id()}),
+    )
+    .await;
+    assert!(refused.contains("paused"), "{refused}");
+
+    // The abort fails on its last step, the one that reopens the thread.
+    sqlx::query(
+        "CREATE FUNCTION refuse_reopen() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER refuse_reopen BEFORE UPDATE OF write_paused_at ON conversations
+         FOR EACH ROW WHEN (OLD.write_paused_at IS NOT NULL AND NEW.write_paused_at IS NULL)
+         EXECUTE FUNCTION refuse_reopen()",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert!(
+        migrate::abort(&h.pool, migration, "the copy failed")
+            .await
+            .is_err()
+    );
+
+    // Nothing of it stuck: the run still owns the pause, and the same
+    // command resumes it instead of refusing the thread.
+    let (state,): (String,) =
+        sqlx::query_as("SELECT state FROM conversation_migrations WHERE id = $1")
+            .bind(migration)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        state, "copying",
+        "the run was failed without its pause lifted"
+    );
+    assert!(migrate::is_paused(&h.pool, cuuid).await.unwrap());
+    let plans = migrate::plan(&h.pool, team, Direction::ToJetStream, &[cuuid])
+        .await
+        .unwrap();
+    assert!(plans[0].blocked.is_none(), "{:?}", plans[0].blocked);
+    assert!(plans[0].resuming, "an open run is resumed, not refused");
+
+    // With the fault gone, the abort completes all of it at once.
+    sqlx::query("DROP TRIGGER refuse_reopen ON conversations")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    migrate::abort(&h.pool, migration, "the copy failed")
+        .await
+        .unwrap();
+    let (state,): (String,) =
+        sqlx::query_as("SELECT state FROM conversation_migrations WHERE id = $1")
+            .bind(migration)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "failed");
+    assert!(!migrate::is_paused(&h.pool, cuuid).await.unwrap());
+    let plans = migrate::plan(&h.pool, team, Direction::ToJetStream, &[cuuid])
+        .await
+        .unwrap();
+    assert!(plans[0].blocked.is_none(), "{:?}", plans[0].blocked);
+    assert!(!plans[0].resuming);
+    call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "after the abort", "request_id": request_id()}),
+    )
+    .await;
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
+/// An abort takes the thread's row before anything else, the order a send
+/// and the cutover take, so an abort and a cutover of the same run by two
+/// processes queue instead of deadlocking; and it only gives up on a run
+/// that is still open (#180 review).
+#[tokio::test]
+async fn an_abort_takes_the_thread_first_and_leaves_a_settled_run_alone() {
+    use ai_crew_sync::store::migrate;
+
+    let h = require_db!("t_abort_lock_order");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "moving thread", "private": true}),
+    )
+    .await;
+    let cuuid: Uuid = convo["id"].as_str().unwrap().parse().unwrap();
+    sqlx::query("UPDATE conversations SET write_paused_at = now() WHERE id = $1")
+        .bind(cuuid)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (migration,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ($1, $2, 'to_jetstream', 'copying') RETURNING id",
+    )
+    .bind(team)
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+
+    // Someone holds the thread, as a send or a cutover does.
+    let mut holder = h.pool.begin().await.unwrap();
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    sqlx::query("SELECT id FROM conversations WHERE id = $1 FOR UPDATE")
+        .bind(cuuid)
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    let pool = h.pool.clone();
+    let aborting =
+        tokio::spawn(async move { migrate::abort(&pool, migration, "the copy failed").await });
+    let mut parked = false;
+    for _ in 0..400 {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(holder_pid)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        if waiting {
+            parked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(parked, "the abort never waited on the thread");
+
+    // Parked on the thread, the abort holds nothing a cutover would need
+    // after it: the run's row is free.
+    let mut probe = h.pool.begin().await.unwrap();
+    let free =
+        sqlx::query("SELECT id FROM conversation_migrations WHERE id = $1 FOR UPDATE NOWAIT")
+            .bind(migration)
+            .fetch_one(&mut *probe)
+            .await;
+    probe.rollback().await.unwrap();
+    holder.rollback().await.unwrap();
+    aborting.await.unwrap().unwrap();
+    assert!(
+        free.is_ok(),
+        "the abort took the run before the thread: {:?}",
+        free.err()
+    );
+    assert!(!migrate::is_paused(&h.pool, cuuid).await.unwrap());
+
+    // A run another process already cut over is not failed after the fact.
+    let (settled,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ($1, $2, 'to_jetstream', 'cut_over') RETURNING id",
+    )
+    .bind(team)
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    migrate::abort(&h.pool, settled, "a late failure")
+        .await
+        .unwrap();
+    let (state,): (String,) =
+        sqlx::query_as("SELECT state FROM conversation_migrations WHERE id = $1")
+            .bind(settled)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "cut_over", "a settled run was rewritten as failed");
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
+/// A reverse move that is given up on keeps the copies that verified. It
+/// used to blank every body it had written back, verified or not, without
+/// asking the broker, and a move to Postgres is what runs when the broker
+/// is going bad: a verified copy can be the last one (#183 review).
+#[tokio::test]
+async fn a_reverse_abort_keeps_the_copies_that_verified() {
+    use ai_crew_sync::store::migrate;
+
+    let h = require_db!("t_reverse_abort");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "coming home", "private": true}),
+    )
+    .await;
+    let cuuid: Uuid = convo["id"].as_str().unwrap().parse().unwrap();
+    let mut ids = Vec::new();
+    for body in ["verified on the way back", "written but never verified"] {
+        let sent = call(
+            &owner,
+            "send_conversation_message",
+            json!({"conversation_id": convo["id"], "body": body, "request_id": request_id()}),
+        )
+        .await;
+        ids.push(
+            sent["message_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        );
+    }
+
+    // Both still broker-authoritative, both written back into their rows by
+    // a move to Postgres that stopped before the cutover: one verified,
+    // one not.
+    sqlx::query("UPDATE conversation_messages SET backend = 'jetstream' WHERE id = ANY($1)")
+        .bind(&ids)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE conversations SET write_paused_at = now() WHERE id = $1")
+        .bind(cuuid)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (migration,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ($1, $2, 'to_postgres', 'copying') RETURNING id",
+    )
+    .bind(team)
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    for (id, state) in [(ids[0], "verified"), (ids[1], "copied")] {
+        sqlx::query(
+            "INSERT INTO conversation_migration_items (migration_id, message_id, checksum, bytes, state)
+             VALUES ($1, $2, 'sum', 1, $3)",
+        )
+        .bind(migration)
+        .bind(id)
+        .bind(state)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    }
+
+    migrate::abort(&h.pool, migration, "the broker went away")
+        .await
+        .unwrap();
+    let body_of = |id: Uuid| {
+        let pool = h.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT body FROM conversation_messages WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        body_of(ids[0]).await,
+        "verified on the way back",
+        "a verified copy was thrown away"
+    );
+    assert_eq!(
+        body_of(ids[1]).await,
+        "",
+        "an unverified copy must not be served as the body"
+    );
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
+/// The worker path's last attempt. A backend that keeps the body and never
+/// confirms it must not end as `failed`: "we did not hear back" and "it is
+/// not there" are different facts, and only one of them is a gap.
+#[tokio::test]
+async fn a_lost_confirmation_is_not_a_failure_when_the_backend_kept_it() {
+    use ai_crew_sync::store::backend::{Faults, MessagingBackend, PostgresBackend};
+    use ai_crew_sync::store::outbox::{self, Settled};
+
+    let h = require_db!("t_lost_confirmations");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let dani = connect_with_session(&h.base, &dani_token, "review").await;
+
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "kept but unconfirmed", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+    let cuuid: Uuid = cid.parse().unwrap();
+    outbox::set_publication(&h.pool, cuuid, true).await.unwrap();
+    let sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "written, never acknowledged",
+               "request_id": request_id()}),
+    )
+    .await;
+    let mid: Uuid = sent["message_id"].as_str().unwrap().parse().unwrap();
+
+    // Every attempt writes the body and reports that it did not.
+    let losing = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            lose_confirmation: true,
+            ..Default::default()
+        },
+    );
+    let mut last = None;
+    for attempt in 1..=outbox::MAX_ATTEMPTS {
+        sqlx::query("UPDATE conversation_outbox SET next_attempt_at = now()")
+            .execute(&h.pool)
+            .await
+            .unwrap();
+        last = outbox::run_once(&h.pool, &losing, "worker").await.unwrap();
+        if attempt < outbox::MAX_ATTEMPTS {
+            assert!(
+                matches!(last, Some(Settled::Retrying { .. })),
+                "attempt {attempt} retries: {last:?}"
+            );
+        }
+    }
+
+    // The last attempt asks instead of assuming. The backend has it, so the
+    // message is stored and the receipts say when.
+    assert_eq!(
+        last,
+        Some(Settled::Stored),
+        "the backend kept the body; giving up would have recorded a gap that is not there"
+    );
+    let (state, locator): (String, Option<String>) = sqlx::query_as(
+        "SELECT publication_state, canonical_locator FROM conversation_messages WHERE id = $1",
+    )
+    .bind(mid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "stored");
+    let plain = PostgresBackend::new(h.pool.clone());
+    assert_eq!(
+        plain
+            .fetch(
+                &ai_crew_sync::store::backend::Locator(locator.clone().unwrap()),
+                mid
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("written, never acknowledged"),
+        "and it is the body that was sent"
+    );
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(
+        receipts["receipts"][0]["stored_at"].is_string(),
+        "stored once it was established, not before: {receipts}"
+    );
+
+    // A backend that genuinely does not have it still fails, visibly. The
+    // fix must not turn every give-up into a success.
+    let gone = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "never written anywhere",
+               "request_id": request_id()}),
+    )
+    .await;
+    let unreachable = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            retryable: outbox::MAX_ATTEMPTS as usize + 1,
+            ..Default::default()
+        },
+    );
+    let mut last = None;
+    for _ in 1..=outbox::MAX_ATTEMPTS {
+        sqlx::query("UPDATE conversation_outbox SET next_attempt_at = now()")
+            .execute(&h.pool)
+            .await
+            .unwrap();
+        last = outbox::run_once(&h.pool, &unreachable, "worker")
+            .await
+            .unwrap();
+    }
+    assert_eq!(last, Some(Settled::Failed));
+    let (state,): (String,) =
+        sqlx::query_as("SELECT publication_state FROM conversation_messages WHERE id = $1")
+            .bind(
+                gone["message_id"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<Uuid>()
+                    .unwrap(),
+            )
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        state, "failed",
+        "a body nobody has is a gap, and it is shown"
+    );
+
+    for c in [owner, dani] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Losing the broker costs the bodies it holds, for as long as it is away,
+/// and nothing else. Reproduced on a real deployment by deleting the
+/// broker's volume: the thread stopped reading at all.
+#[tokio::test]
+async fn a_broker_that_is_gone_does_not_take_the_thread_with_it() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::outbox;
+
+    let h = require_db_broker!("t_broker_gone");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let dani = connect_with_session(&h.base, &dani_token, "review").await;
+
+    // One thread that stays on Postgres, and one routed to the broker.
+    let local = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "en postgres", "private": true}),
+    )
+    .await;
+    call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": local["id"], "body": "still here", "request_id": request_id()}),
+    )
+    .await;
+
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "en el broker", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+    let sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "en el broker", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(
+        outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+        Some(outbox::Settled::Stored)
+    );
+    outbox::release_published_bodies(
+        &h.pool,
+        &ai_crew_sync::store::routing::Backends::with_jetstream(h.pool.clone(), config.clone()),
+        Some(cid.parse().unwrap()),
+        0,
+    )
+    .await
+    .unwrap();
+
+    // The broker loses everything. Not retention, not a tombstone: gone.
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+
+    // The thread still reads. The message keeps its place, its sender and
+    // its sequence, and says why the body is not here.
+    let page = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    let msgs = page["messages"]
+        .as_array()
+        .expect("the page is still a page");
+    assert_eq!(msgs.len(), 1, "the thread did not vanish: {page}");
+    assert_eq!(msgs[0]["message_id"], sent["message_id"]);
+    assert_eq!(msgs[0]["seq"], 1);
+    assert_eq!(msgs[0]["from_address"], "joaquin/impl");
+    assert_eq!(msgs[0]["body"], "");
+    assert_eq!(
+        msgs[0]["publication"], "stored",
+        "it *is* stored; what is missing is this process's way to read it"
+    );
+    assert!(
+        msgs[0]["unavailable"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be reached"),
+        "and it says so: {}",
+        msgs[0]
+    );
+
+    // Its receipts survive, and so does the rest of the bus.
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert_eq!(receipts["total"], 1, "{receipts}");
+    let still = call(
+        &owner,
+        "read_conversation",
+        json!({"conversation_id": local["id"]}),
+    )
+    .await;
+    assert_eq!(
+        still["messages"][0]["body"], "still here",
+        "a thread on Postgres is untouched by the broker's trouble"
+    );
+
+    // And a send is still accepted: it queues, as it does for any outage.
+    let after = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "después", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(after["stored"], false, "{after}");
+
+    for c in [owner, dani] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// A claim has to mean something on the way out too. Found on a deployment:
+/// anyone on the team could mark a task done while its holder was still
+/// working, and the holder learned about it from a refused renewal.
+#[tokio::test]
+async fn completing_a_task_respects_whoever_holds_it() {
+    let h = require_db!("t_complete_claim");
+    let owner = seed_agent(&h.pool, "acme", "joaquin").await;
+    let holder = seed_agent(&h.pool, "acme", "marta").await;
+    let other = seed_agent(&h.pool, "acme", "dani").await;
+    let o = connect(&h.base, &owner).await;
+    let m = connect(&h.base, &holder).await;
+    let d = connect(&h.base, &other).await;
+
+    call(
+        &o,
+        "create_task",
+        json!({"key": "suya", "title": "el trabajo de marta"}),
+    )
+    .await;
+    let claimed = call(
+        &m,
+        "claim_task",
+        json!({"key": "suya", "lease_seconds": 300}),
+    )
+    .await;
+    assert_eq!(claimed["claimed"], true);
+
+    // The holder is working and the lease is live.
+    let err = call_expect_error(&d, "complete_task", json!({"key": "suya"})).await;
+    assert!(err.contains("held by marta"), "{err}");
+    assert!(
+        err.contains("end work somebody else is doing"),
+        "and it says why: {err}"
+    );
+    let still = call(&o, "get_task", json!({"key": "suya"})).await;
+    assert_eq!(
+        still["task"]["status"], "claimed",
+        "nothing was written: {still}"
+    );
+
+    // Its holder finishes it.
+    let done = call(
+        &m,
+        "complete_task",
+        json!({"key": "suya", "result": "hecho"}),
+    )
+    .await;
+    assert_eq!(done["status"], "done");
+
+    // An unclaimed task is anyone's to finish: nobody's work is ended.
+    call(
+        &o,
+        "create_task",
+        json!({"key": "libre", "title": "de nadie"}),
+    )
+    .await;
+    let done = call(&d, "complete_task", json!({"key": "libre"})).await;
+    assert_eq!(done["status"], "done", "{done}");
+
+    // And an expired lease is fair game, which is what a lease is for.
+    call(
+        &o,
+        "create_task",
+        json!({"key": "caducada", "title": "abandonada"}),
+    )
+    .await;
+    call(
+        &m,
+        "claim_task",
+        json!({"key": "caducada", "lease_seconds": 60}),
+    )
+    .await;
+    sqlx::query(
+        "UPDATE tasks SET lease_expires_at = now() - interval '1 minute' WHERE key = 'caducada'",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let done = call(&d, "complete_task", json!({"key": "caducada"})).await;
+    assert_eq!(
+        done["status"], "done",
+        "a claim nobody renewed does not hold the task for ever: {done}"
+    );
+
+    for c in [o, m, d] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Every task write is fenced by the session epoch, not only the claim.
+/// Found in review: a context admitted before a resume could still complete
+/// the replacement window's work, because the holder predicate matches the
+/// agent and the label, which a resumed window shares.
+#[tokio::test]
+async fn a_replaced_window_cannot_finish_the_work_of_the_one_that_replaced_it() {
+    use ai_crew_sync::store::tasks;
+
+    let h = require_db!("t_task_epoch_fence");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let agent = connect(&h.base, &token).await;
+    let cred = call(&agent, "register_session", json!({"session": "obrero"})).await;
+    let window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+
+    call(
+        &window,
+        "create_task",
+        json!({"key": "suya", "title": "en curso"}),
+    )
+    .await;
+    let claimed = call(
+        &window,
+        "claim_task",
+        json!({"key": "suya", "lease_seconds": 600}),
+    )
+    .await;
+    assert_eq!(claimed["claimed"], true);
+
+    // The context that connection was admitted with, kept while the window
+    // is resumed by the process that took over.
+    let stale = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'joaquin'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "joaquin".into(),
+        team_id: team_id(&h.pool, "acme").await,
+        team_slug: "acme".into(),
+        session: "obrero".into(),
+        session_id: Some(cred["session_id"].as_str().unwrap().parse().unwrap()),
+        session_epoch: Some(cred["epoch"].as_i64().unwrap()),
+        token_id: None,
+    };
+    let resumed = call(&window, "resume_session", json!({})).await;
+    assert_eq!(resumed["epoch"], 2);
+
+    // Same agent, same label, replaced connection. Every write is refused.
+    for (name, result) in [
+        (
+            "complete",
+            tasks::complete_task(&h.pool, &stale, "suya", Some("no soy yo".into()))
+                .await
+                .err(),
+        ),
+        (
+            "renew",
+            tasks::renew_lease(&h.pool, &stale, "suya", Some(600))
+                .await
+                .err(),
+        ),
+        (
+            "release",
+            tasks::release_task(&h.pool, &stale, "suya").await.err(),
+        ),
+        (
+            "claim",
+            tasks::claim_task(&h.pool, &stale, "suya", Some(600))
+                .await
+                .err(),
+        ),
+    ] {
+        let err = result
+            .unwrap_or_else(|| panic!("{name} accepted a replaced connection"))
+            .to_string();
+        assert!(err.contains("stale"), "{name}: {err}");
+        assert!(err.contains("Nothing was written"), "{name}: {err}");
+    }
+
+    // The resume rotated the secret, so the live window is the one holding
+    // the new credential.
+    let live = connect(&h.base, resumed["session_token"].as_str().unwrap()).await;
+    let still = call(&live, "get_task", json!({"key": "suya"})).await;
+    assert_eq!(
+        still["task"]["status"], "claimed",
+        "the task is still the live window's: {still}"
+    );
+
+    // And that window finishes it.
+    let done = call(
+        &live,
+        "complete_task",
+        json!({"key": "suya", "result": "hecho"}),
+    )
+    .await;
+    assert_eq!(done["status"], "done", "{done}");
+
+    for c in [agent, window, live] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// A path this server does not serve is a path, not a credential problem.
+/// Found on the deployment: a mistyped URL answered "missing bearer token",
+/// and a mistyped /admin path told an operator holding a perfectly good
+/// credential that it was invalid or revoked.
+#[tokio::test]
+async fn a_mistyped_path_does_not_blame_the_credential() {
+    let h = require_db!("t_unknown_paths");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let client = reqwest::Client::new();
+
+    for (path, bearer) in [
+        ("/pepito", None),
+        ("/pepito", Some(token.as_str())),
+        ("/admin/no-existe", None),
+        ("/dashboard/nope", None),
+    ] {
+        let mut req = client.get(format!("{}{path}", h.base));
+        if let Some(b) = bearer {
+            req = req.bearer_auth(b);
+        }
+        let resp = req.send().await.unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            404,
+            "{path} (bearer: {}) answered {status}: {body}",
+            bearer.is_some()
+        );
+        assert!(
+            !body.contains("bearer") && !body.contains("revoked"),
+            "{path} blamed the credential: {body}"
+        );
+        assert!(
+            body.contains("/mcp"),
+            "and it says what this server does serve: {body}"
+        );
+    }
+
+    // A query string can carry a credential, and an error body travels: it
+    // is pasted into issues and scraped out of logs. The 404 names the path
+    // and nothing else.
+    let resp = client
+        .get(format!(
+            "{}/admin/not-a-route?token=acs_do_not_echo_me&other=keep",
+            h.base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        !body.contains("do_not_echo_me") && !body.contains("token="),
+        "the 404 repeated a query credential: {body}"
+    );
+    assert!(body.contains("/admin/not-a-route"), "{body}");
+
+    // Anything under /mcp is the MCP endpoint's own namespace, and that one
+    // does ask for a token before it says anything at all.
+    let resp = client
+        .get(format!("{}/mcp/extra", h.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "under /mcp, authentication comes first");
+
+    // The real endpoints still guard themselves.
+    let resp = client
+        .post(format!("{}/mcp", h.base))
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "/mcp without a token is still refused");
+    let resp = client
+        .post(format!("{}/mcp", h.base))
+        .bearer_auth("acs_0000000000000000000000000000000000000000000000000000000000000000")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "/mcp with a bad token is still refused");
+
+    let c = connect(&h.base, &token).await;
+    let me = call(&c, "whoami", json!({})).await;
+    assert_eq!(me["agent"], "joaquin", "and a good one still works");
+    let _ = c.cancel().await;
+
+    h.shutdown().await;
+}
+
+/// The rest of a window's own state is fenced too. A replaced connection
+/// cannot put back the lock its replacement holds, cannot advance the live
+/// window's read cursor past messages it never saw, and cannot pull
+/// references off the live window's inbox.
+#[tokio::test]
+async fn a_replaced_window_cannot_act_as_the_one_that_replaced_it() {
+    use ai_crew_sync::store::{locks, messaging};
+
+    let h = require_db!("t_window_state_fence");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    let agent = connect(&h.base, &token).await;
+    let cred = call(&agent, "register_session", json!({"session": "obrero"})).await;
+    let window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let dani = connect(&h.base, &dani_token).await;
+
+    let got = call(
+        &window,
+        "acquire_lock",
+        json!({"name": "deploy", "ttl_seconds": 300}),
+    )
+    .await;
+    assert_eq!(got["acquired"], true);
+    // A direct message the live window has not read yet.
+    call(
+        &dani,
+        "post_message",
+        json!({"to": "joaquin/obrero", "body": "para la ventana viva"}),
+    )
+    .await;
+
+    let stale = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'joaquin'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "joaquin".into(),
+        team_id: team_id(&h.pool, "acme").await,
+        team_slug: "acme".into(),
+        session: "obrero".into(),
+        session_id: Some(cred["session_id"].as_str().unwrap().parse().unwrap()),
+        session_epoch: Some(cred["epoch"].as_i64().unwrap()),
+        token_id: None,
+    };
+    let resumed = call(&window, "resume_session", json!({})).await;
+    assert_eq!(resumed["epoch"], 2);
+
+    let err = locks::release_lock(&h.pool, &stale, "deploy")
+        .await
+        .expect_err("a replaced connection released the live window's lock")
+        .to_string();
+    assert!(err.contains("stale"), "{err}");
+
+    let err = messaging::read_messages(
+        &h.pool,
+        &stale,
+        messaging::ReadInput {
+            scope: String::new(),
+            only_new: true,
+            limit: 50,
+            all_sessions: false,
+        },
+    )
+    .await
+    .expect_err("a replaced connection advanced the live window's cursor")
+    .to_string();
+    assert!(err.contains("stale"), "{err}");
+
+    // The live window still holds the lock and still sees its message.
+    let live = connect(&h.base, resumed["session_token"].as_str().unwrap()).await;
+    let locks_now = call(&live, "list_locks", json!({})).await;
+    assert!(
+        locks_now["locks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["name"] == "deploy"),
+        "the lock is gone: {locks_now}"
+    );
+    let unread = call(&live, "read_messages", json!({})).await;
+    assert!(
+        unread["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["body"] == "para la ventana viva"),
+        "the live window lost a message to a cursor it never moved: {unread}"
+    );
+
+    for c in [agent, window, dani, live] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// And the inbox: a replaced connection does not pull the live window's
+/// references off the consumer.
+#[tokio::test]
+async fn a_replaced_window_cannot_fetch_the_inbox_of_the_one_that_replaced_it() {
+    use ai_crew_sync::store::jetstream::Config;
+    use ai_crew_sync::store::{inbox, routing::Backends};
+
+    let h = require_db_broker!("t_inbox_epoch_fence");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    enable_conversations(&h.pool, "acme").await;
+    let agent = connect(&h.base, &token).await;
+    let cred = call(&agent, "register_session", json!({"session": "lector"})).await;
+    let window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+
+    let stale = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'joaquin'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "joaquin".into(),
+        team_id: team_id(&h.pool, "acme").await,
+        team_slug: "acme".into(),
+        session: "lector".into(),
+        session_id: Some(cred["session_id"].as_str().unwrap().parse().unwrap()),
+        session_epoch: Some(cred["epoch"].as_i64().unwrap()),
+        token_id: None,
+    };
+    let resumed = call(&window, "resume_session", json!({})).await;
+    assert_eq!(resumed["epoch"], 2);
+
+    let backends = Backends::with_jetstream(h.pool.clone(), Config::new(nats_url()));
+    let err = inbox::fetch(&h.pool, &backends, &stale, Some(5))
+        .await
+        .expect_err("a replaced connection fetched the live window's inbox")
+        .to_string();
+    assert!(err.contains("stale"), "{err}");
+
+    for c in [agent, window] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// The attachment cap is decided under the parent's row lock. Counted
+/// outside the transaction, ten uploads racing for the last slots all saw
+/// room and all committed.
+#[tokio::test]
+async fn the_attachment_cap_holds_under_a_race() {
+    use base64::Engine;
+    let h = require_db!("t_attachment_cap_race");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let client = Arc::new(connect(&h.base, &token).await);
+    call(
+        &client,
+        "create_task",
+        json!({"key": "adjuntos", "title": "muchos"}),
+    )
+    .await;
+
+    let data = base64::engine::general_purpose::STANDARD.encode(b"x");
+    let mut handles = Vec::new();
+    for i in 0..12 {
+        let c = Arc::clone(&client);
+        let data = data.clone();
+        handles.push(tokio::spawn(async move {
+            let args: serde_json::Map<String, Value> = serde_json::from_value(json!({
+                "task": "adjuntos", "filename": format!("f{i}.txt"), "data_base64": data
+            }))
+            .unwrap();
+            c.call_tool(CallToolRequestParams::new("attach_file".to_string()).with_arguments(args))
+                .await
+                .map(|r| r.is_error != Some(true))
+                .unwrap_or(false)
+        }));
+    }
+    let mut ok = 0;
+    for h in handles {
+        if h.await.unwrap() {
+            ok += 1;
+        }
+    }
+    let (stored,): (i64,) = sqlx::query_as("SELECT count(*) FROM attachments")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored, 8,
+        "the cap is eight, whatever the race: {stored} stored"
+    );
+    assert_eq!(ok, 8, "and exactly eight callers were told yes");
+
+    let _ = Arc::try_unwrap(client).ok().map(|c| c.cancel());
+    h.shutdown().await;
+}
+
+/// A live label is refused even when the refusal spells a missing method.
+/// The conversation id here hashes to the label `s-32601f03e877`; the bus
+/// quotes it when a second process tries to register it without the
+/// window's credential, and the proxy once read that "-32601" as "this bus
+/// has no register_session" and carried on label-only with the parent
+/// token — the one case the conflict exists to stop.
+#[tokio::test]
+async fn a_live_label_is_refused_even_when_it_spells_a_missing_method() {
+    let h = require_db!("t_proxy_32601");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let profiles = [("acme", "acme", "joaquin", token.as_str())];
+    // Two config dirs: the second process has no binding to resume from,
+    // so it can only ask the bus to register the label afresh.
+    let dir_a = proxy_config_dir(&h.base, &profiles);
+    let dir_b = proxy_config_dir(&h.base, &profiles);
+    let mut repos = Vec::new();
+    for dir in [&dir_a, &dir_b] {
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+        repos.push(repo);
+    }
+
+    let holder = spawn_proxy(&dir_a, &repos[0], &["--host-session", "conv-1714608"], &[]).await;
+    let s = call(&holder, "session_status", json!({})).await;
+    assert_eq!(
+        s["session"], "s-32601f03e877",
+        "the fixture id moved; pick another: {s}"
+    );
+    assert_eq!(s["agent"], "joaquin");
+
+    let intruder = spawn_proxy(&dir_b, &repos[1], &["--host-session", "conv-1714608"], &[]).await;
+    let s2 = call(&intruder, "session_status", json!({})).await;
+    assert!(
+        s2["agent"].is_null(),
+        "the second process is not connected: {s2}"
+    );
+    let reason = s2["error"].as_str().unwrap_or_default();
+    assert!(reason.contains("still live"), "{s2}");
+    let err = call_expect_error(&intruder, "whoami", json!({})).await;
+    assert!(err.contains("not connected"), "{err}");
+
+    // The window that owns the label is untouched.
+    assert_eq!(call(&holder, "whoami", json!({})).await["agent"], "joaquin");
+    for c in [holder, intruder] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Route a team's new conversations to JetStream the way an operator does:
+/// the flag on the team plus provisioned streams. The harness server has the
+/// broker configured whenever `require_db_broker!` was used.
+async fn route_team_to_jetstream(h: &Harness, team: &str) {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    let id = team_id(&h.pool, team).await;
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(id)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, id).await.unwrap();
+}
+
+/// Re-admitting a removed member is a moderator decision the bus records as
+/// 'member.readmit'. The audit table's check never listed that action, so
+/// the invitation rolled back with a bare "database error" and the member
+/// stayed out (#125). The rule the readmission keeps: nothing said before
+/// it comes back, however the inviter asks.
+#[tokio::test]
+async fn a_removed_member_is_readmitted_without_its_old_history() {
+    for backend in ["postgres", "jetstream"] {
+        let schema = format!("t_readmit_{backend}");
+        let h = require_db_broker!(&schema);
+        let token = seed_agent(&h.pool, "acme", "joaquin").await;
+        let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+        enable_conversations(&h.pool, "acme").await;
+        if backend == "jetstream" {
+            route_team_to_jetstream(&h, "acme").await;
+        }
+        let owner = connect_with_session(&h.base, &token, "impl").await;
+        let dani = connect_with_session(&h.base, &dani_token, "core").await;
+
+        let convo = call(
+            &owner,
+            "create_conversation",
+            json!({"title": "readmission", "private": true}),
+        )
+        .await;
+        let cid = convo["id"].as_str().unwrap().to_owned();
+        let send = |body: &'static str| {
+            let owner = &owner;
+            let cid = cid.clone();
+            async move {
+                call(
+                    owner,
+                    "send_conversation_message",
+                    json!({"conversation_id": cid, "body": body, "request_id": request_id()}),
+                )
+                .await["message_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            }
+        };
+        let before = send("before the removal").await;
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "dani/core", "history_from_start": true}),
+        )
+        .await;
+        call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+        let seen = call(
+            &dani,
+            "get_conversation_message",
+            json!({"message_id": before}),
+        )
+        .await;
+        assert_eq!(seen["body"], "before the removal", "[{backend}] {seen}");
+
+        call(
+            &owner,
+            "remove_conversation_member",
+            json!({"conversation_id": cid, "address": "dani/core"}),
+        )
+        .await;
+        let meanwhile = send("said while removed").await;
+
+        // The readmission goes through, whatever history the inviter asks
+        // for, and it is recorded as what it is.
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "dani/core", "history_from_start": true}),
+        )
+        .await;
+        let cid_uuid: Uuid = cid.parse().unwrap();
+        let (state, from_seq): (String, Option<i64>) = sqlx::query_as(
+            "SELECT state, history_from_seq FROM conversation_memberships
+              WHERE conversation_id = $1 AND session = 'core'",
+        )
+        .bind(cid_uuid)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(state, "invited", "[{backend}]");
+        assert_eq!(
+            from_seq,
+            Some(2),
+            "[{backend}] a readmission starts here, not at the start"
+        );
+        let (readmits,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM conversation_audit
+              WHERE conversation_id = $1 AND action = 'member.readmit'",
+        )
+        .bind(cid_uuid)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(readmits, 1, "[{backend}] the readmission is audited as one");
+
+        call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+        for hidden in [&before, &meanwhile] {
+            let err = call_expect_error(
+                &dani,
+                "get_conversation_message",
+                json!({"message_id": hidden}),
+            )
+            .await;
+            assert!(!err.contains("database error"), "[{backend}] {err}");
+        }
+        let after = send("after the readmission").await;
+        let seen = call(
+            &dani,
+            "get_conversation_message",
+            json!({"message_id": after}),
+        )
+        .await;
+        assert_eq!(seen["body"], "after the readmission", "[{backend}] {seen}");
+        let read = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+        assert_eq!(
+            read["messages"].as_array().map(Vec::len),
+            Some(1),
+            "[{backend}] only what was said after the readmission: {read}"
+        );
+
+        for c in [owner, dani] {
+            let _ = c.cancel().await;
+        }
+        h.shutdown().await;
+    }
+}
+
+/// A moderator admitted without the past cannot hand that past to anyone:
+/// not to another agent, not to another window of its own agent. Its grant
+/// is clamped to its own floor, for bodies and for receipts alike, and the
+/// audit row keeps what was asked. An inviter that can read the start still
+/// grants it (#124).
+#[tokio::test]
+async fn a_late_moderator_cannot_grant_history_it_cannot_read() {
+    for backend in ["postgres", "jetstream"] {
+        let schema = format!("t_late_moderator_{backend}");
+        let h = require_db_broker!(&schema);
+        let owner_token = seed_agent(&h.pool, "acme", "joaquin").await;
+        let reader_token = seed_agent(&h.pool, "acme", "dani").await;
+        let outsider_token = seed_agent(&h.pool, "acme", "marta").await;
+        let full_token = seed_agent(&h.pool, "acme", "luis").await;
+        enable_conversations(&h.pool, "acme").await;
+        if backend == "jetstream" {
+            route_team_to_jetstream(&h, "acme").await;
+        }
+        let owner = connect_with_session(&h.base, &owner_token, "owner").await;
+        let reader = connect_with_session(&h.base, &reader_token, "reader").await;
+        let outsider = connect_with_session(&h.base, &outsider_token, "outsider").await;
+        let sibling = connect_with_session(&h.base, &reader_token, "other").await;
+        let full = connect_with_session(&h.base, &full_token, "full").await;
+
+        let convo = call(
+            &owner,
+            "create_conversation",
+            json!({"title": "late moderator", "private": true}),
+        )
+        .await;
+        let cid = convo["id"].as_str().unwrap().to_owned();
+        let withheld = call(
+            &owner,
+            "send_conversation_message",
+            json!({"conversation_id": cid, "body": "history withheld from later moderator",
+                   "request_id": request_id()}),
+        )
+        .await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // A moderator, admitted from here on.
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "dani/reader", "role": "moderator"}),
+        )
+        .await;
+        call(
+            &reader,
+            "join_conversation",
+            json!({"conversation_id": cid}),
+        )
+        .await;
+        let err = call_expect_error(
+            &reader,
+            "get_conversation_message",
+            json!({"message_id": withheld}),
+        )
+        .await;
+        assert!(!err.contains("database error"), "[{backend}] {err}");
+
+        // It invites another agent and another window of its own agent,
+        // asking for the whole history. Both invitations go through, with
+        // the moderator's own floor.
+        for address in ["marta/outsider", "dani/other"] {
+            call(
+                &reader,
+                "invite_to_conversation",
+                json!({"conversation_id": cid, "address": address, "history_from_start": true}),
+            )
+            .await;
+        }
+        for (address, window) in [("marta/outsider", &outsider), ("dani/other", &sibling)] {
+            call(window, "join_conversation", json!({"conversation_id": cid})).await;
+            let err = call_expect_error(
+                window,
+                "get_conversation_message",
+                json!({"message_id": withheld}),
+            )
+            .await;
+            assert!(
+                !err.contains("database error"),
+                "[{backend}] {address} body: {err}"
+            );
+            let err = call_expect_error(
+                window,
+                "get_message_receipts",
+                json!({"message_id": withheld}),
+            )
+            .await;
+            assert!(
+                !err.contains("database error"),
+                "[{backend}] {address} receipts: {err}"
+            );
+            let read = call(window, "read_conversation", json!({"conversation_id": cid})).await;
+            assert_eq!(
+                read["messages"].as_array().map(Vec::len),
+                Some(0),
+                "[{backend}] {address} reads nothing from before the moderator: {read}"
+            );
+        }
+        let cid_uuid: Uuid = cid.parse().unwrap();
+        let floors: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT session, history_from_seq FROM conversation_memberships
+              WHERE conversation_id = $1 AND session IN ('reader', 'outsider', 'other')
+              ORDER BY session",
+        )
+        .bind(cid_uuid)
+        .fetch_all(&h.pool)
+        .await
+        .unwrap();
+        assert!(
+            floors.iter().all(|(_, f)| *f == Some(1)),
+            "[{backend}] every seat the moderator handed out starts where it did: {floors:?}"
+        );
+        let (requested,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM conversation_audit
+              WHERE conversation_id = $1 AND action = 'member.invite'
+                AND (detail->>'history_from_start_requested')::boolean
+                AND (detail->>'history_from_seq')::bigint = 1",
+        )
+        .bind(cid_uuid)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            requested, 2,
+            "[{backend}] the audit keeps what was asked and what was given"
+        );
+
+        // The owner can read the start, so the owner can grant it.
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "luis/full", "history_from_start": true}),
+        )
+        .await;
+        call(&full, "join_conversation", json!({"conversation_id": cid})).await;
+        let seen = call(
+            &full,
+            "get_conversation_message",
+            json!({"message_id": withheld}),
+        )
+        .await;
+        assert_eq!(
+            seen["body"], "history withheld from later moderator",
+            "[{backend}] {seen}"
+        );
+
+        // A seat that had the whole history and left does not get it back
+        // from an inviter who cannot read it: the floor is decided now.
+        call(&full, "leave_conversation", json!({"conversation_id": cid})).await;
+        call(
+            &reader,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "luis/full", "history_from_start": true}),
+        )
+        .await;
+        call(&full, "join_conversation", json!({"conversation_id": cid})).await;
+        let err = call_expect_error(
+            &full,
+            "get_conversation_message",
+            json!({"message_id": withheld}),
+        )
+        .await;
+        assert!(
+            !err.contains("database error"),
+            "[{backend}] left and back: {err}"
+        );
+        let (floor,): (Option<i64>,) = sqlx::query_as(
+            "SELECT history_from_seq FROM conversation_memberships
+              WHERE conversation_id = $1 AND session = 'full'",
+        )
+        .bind(cid_uuid)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            floor,
+            Some(1),
+            "[{backend}] the old floor did not come back"
+        );
+
+        for c in [owner, reader, outsider, sibling, full] {
+            let _ = c.cancel().await;
+        }
+        h.shutdown().await;
+    }
+}
+
+/// A transfer to a window that already has a seat changes nothing: it is
+/// refused before anything is written, and the target keeps its role, its
+/// history boundary and its credential binding while the source stays. A
+/// window that holds an invitation, or that was removed, is not a target
+/// either. A window that left is, and then the handoff completes (#126).
+#[tokio::test]
+async fn a_transfer_to_a_window_with_a_seat_changes_nothing() {
+    for backend in ["postgres", "jetstream"] {
+        let schema = format!("t_transfer_target_{backend}");
+        let h = require_db_broker!(&schema);
+        let token = seed_agent(&h.pool, "acme", "joaquin").await;
+        enable_conversations(&h.pool, "acme").await;
+        if backend == "jetstream" {
+            route_team_to_jetstream(&h, "acme").await;
+        }
+        // Two registered windows of the same agent, each with its own
+        // credential, plus a third that only ever gets invited.
+        let agent = connect(&h.base, &token).await;
+        let owner_cred = call(&agent, "register_session", json!({"session": "owner"})).await;
+        let owner = connect(&h.base, owner_cred["session_token"].as_str().unwrap()).await;
+        let next_cred = call(&agent, "register_session", json!({"session": "next"})).await;
+        let next = connect(&h.base, next_cred["session_token"].as_str().unwrap()).await;
+
+        let convo = call(
+            &owner,
+            "create_conversation",
+            json!({"title": "handoff", "private": true}),
+        )
+        .await;
+        let cid = convo["id"].as_str().unwrap().to_owned();
+        let cid_uuid: Uuid = cid.parse().unwrap();
+        let earlier = call(
+            &owner,
+            "send_conversation_message",
+            json!({"conversation_id": cid, "body": "before the observer arrived",
+                   "request_id": request_id()}),
+        )
+        .await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "joaquin/next", "role": "observer"}),
+        )
+        .await;
+        call(&next, "join_conversation", json!({"conversation_id": cid})).await;
+        let err = call_expect_error(
+            &next,
+            "get_conversation_message",
+            json!({"message_id": earlier}),
+        )
+        .await;
+        assert!(!err.contains("database error"), "[{backend}] {err}");
+
+        // A message sent while the observer is seated has receipts for the
+        // seats of that moment; a refused transfer must leave them as they
+        // are, denominator included.
+        let seated = call(
+            &owner,
+            "send_conversation_message",
+            json!({"conversation_id": cid, "body": "while the observer is here",
+                   "request_id": request_id()}),
+        )
+        .await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let receipts_before = call(
+            &owner,
+            "get_message_receipts",
+            json!({"message_id": seated}),
+        )
+        .await;
+        assert!(
+            receipts_before["total"].as_u64() >= Some(1),
+            "[{backend}] {receipts_before}"
+        );
+
+        let seat = |session: &'static str| {
+            let pool = h.pool.clone();
+            async move {
+                sqlx::query_as::<_, (String, String, Option<i64>, Option<Uuid>, Option<Uuid>)>(
+                    "SELECT role, state, history_from_seq, session_id, superseded_by
+                       FROM conversation_memberships
+                      WHERE conversation_id = $1 AND session = $2",
+                )
+                .bind(cid_uuid)
+                .bind(session)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let next_before = seat("next").await;
+        assert_eq!(next_before.0, "observer", "[{backend}]");
+        assert_eq!(next_before.2, Some(1), "[{backend}]");
+        assert!(
+            next_before.3.is_some(),
+            "[{backend}] the seat is bound to the window"
+        );
+
+        // Already seated: refused, and nothing moved.
+        let err = call_expect_error(
+            &owner,
+            "transfer_membership",
+            json!({"conversation_id": cid, "to": "joaquin/next"}),
+        )
+        .await;
+        assert!(err.contains("seat of its own"), "[{backend}] {err}");
+        assert!(err.contains("nothing was written"), "[{backend}] {err}");
+        assert_eq!(
+            seat("next").await,
+            next_before,
+            "[{backend}] the target is untouched"
+        );
+        let source = seat("owner").await;
+        assert_eq!(
+            source.1, "active",
+            "[{backend}] the source is not superseded"
+        );
+        assert!(source.4.is_none(), "[{backend}]");
+        let err = call_expect_error(
+            &next,
+            "get_conversation_message",
+            json!({"message_id": earlier}),
+        )
+        .await;
+        assert!(
+            !err.contains("database error"),
+            "[{backend}] still withheld: {err}"
+        );
+        let receipts_after = call(
+            &owner,
+            "get_message_receipts",
+            json!({"message_id": seated}),
+        )
+        .await;
+        assert_eq!(
+            receipts_after, receipts_before,
+            "[{backend}] the receipts and their denominator are untouched"
+        );
+        let err =
+            call_expect_error(&next, "join_conversation", json!({"conversation_id": cid})).await;
+        assert!(
+            err.contains("already in this conversation"),
+            "[{backend}] {err}"
+        );
+
+        // Merely invited: refused too.
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "joaquin/third"}),
+        )
+        .await;
+        let err = call_expect_error(
+            &owner,
+            "transfer_membership",
+            json!({"conversation_id": cid, "to": "joaquin/third"}),
+        )
+        .await;
+        assert!(
+            err.contains("already holds an invitation"),
+            "[{backend}] {err}"
+        );
+
+        // Removed: a transfer does not undo a removal.
+        call(
+            &owner,
+            "remove_conversation_member",
+            json!({"conversation_id": cid, "address": "joaquin/next"}),
+        )
+        .await;
+        let err = call_expect_error(
+            &owner,
+            "transfer_membership",
+            json!({"conversation_id": cid, "to": "joaquin/next"}),
+        )
+        .await;
+        assert!(err.contains("does not undo a removal"), "[{backend}] {err}");
+        assert_eq!(seat("next").await.1, "removed", "[{backend}]");
+
+        // Re-admitted, then gone of its own accord: that seat can be offered
+        // the handoff, and accepting it completes the transfer.
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "joaquin/next"}),
+        )
+        .await;
+        call(&next, "join_conversation", json!({"conversation_id": cid})).await;
+        call(&next, "leave_conversation", json!({"conversation_id": cid})).await;
+        let proposal = call(
+            &owner,
+            "transfer_membership",
+            json!({"conversation_id": cid, "to": "joaquin/next"}),
+        )
+        .await;
+        assert_eq!(proposal["state"], "proposed", "[{backend}] {proposal}");
+        call(&next, "join_conversation", json!({"conversation_id": cid})).await;
+        let seen = call(
+            &next,
+            "get_conversation_message",
+            json!({"message_id": earlier}),
+        )
+        .await;
+        assert_eq!(
+            seen["body"], "before the observer arrived",
+            "[{backend}] the seat's history came with it: {seen}"
+        );
+        let taken = seat("next").await;
+        assert_eq!(
+            (taken.0.as_str(), taken.1.as_str(), taken.2),
+            ("owner", "active", None),
+            "[{backend}]"
+        );
+        assert!(
+            taken.3.is_some(),
+            "[{backend}] bound to the window that accepted"
+        );
+        let source = seat("owner").await;
+        assert_eq!(source.1, "left", "[{backend}] the source is superseded");
+        assert!(source.4.is_some(), "[{backend}]");
+
+        for c in [agent, owner, next] {
+            let _ = c.cancel().await;
+        }
+        h.shutdown().await;
+    }
+}
+
+/// A waiter asking for notes, tasks or locks wakes when a teammate writes
+/// one. Every wait test before this asked for messages, so the other three
+/// kinds were never seen to arrive (#128).
+#[tokio::test]
+async fn wait_for_updates_wakes_on_notes_tasks_and_locks() {
+    let h = require_db!("t_wait_kinds");
+    let a = seed_agent(&h.pool, "acme", "joaquin").await;
+    let b = seed_agent(&h.pool, "acme", "marta").await;
+    let writer = connect(&h.base, &a).await;
+
+    for (kind, tool, args) in [
+        (
+            "note",
+            "set_note",
+            json!({"key": "wake-note", "value": "x"}),
+        ),
+        (
+            "task",
+            "create_task",
+            json!({"key": "wake-task", "title": "t"}),
+        ),
+        (
+            "lock",
+            "acquire_lock",
+            json!({"name": "wake-lock", "ttl_seconds": 30}),
+        ),
+    ] {
+        let waiter = connect(&h.base, &b).await;
+        let wait = tokio::spawn({
+            let kind = kind.to_owned();
+            async move {
+                let r = call(
+                    &waiter,
+                    "wait_for_updates",
+                    json!({"kinds": [kind], "timeout_seconds": 8}),
+                )
+                .await;
+                let _ = waiter.cancel().await;
+                r
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        call(&writer, tool, args).await;
+        let r = wait.await.unwrap();
+        assert_eq!(r["woke"], true, "{kind}: {r}");
+        assert_eq!(r["events"][0]["kind"], kind, "{kind}: {r}");
+    }
+    let _ = writer.cancel().await;
+    h.shutdown().await;
+}
+
+/// A LISTEN connection can die without a word: Swarm's IPVS forgets an idle
+/// TCP connection after fifteen minutes and tells neither end, and a bus
+/// sat "attached" for hours while no wake arrived (#128). Each replica now
+/// pings itself through Postgres; three unanswered pings and the listener is
+/// dropped and attached afresh, and `/health` says which state it is in.
+#[tokio::test]
+async fn a_listener_that_went_deaf_is_noticed_and_reattached() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut h = require_db!("t_deaf_listener");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let marta = seed_agent(&h.pool, "acme", "marta").await;
+
+    // A TCP proxy in front of Postgres that can turn a connection into a
+    // black hole: bytes are read and dropped in both directions, the socket
+    // stays open, nobody is told. It remembers which connections said
+    // LISTEN, because those are the ones the bus can only wait on.
+    let url = db_url().unwrap();
+    let at = url.rfind('@').unwrap();
+    let slash = at + url[at..].find('/').unwrap();
+    let upstream = url[at + 1..slash].to_owned();
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxied_url = format!(
+        "{}@{}{}",
+        &url[..at],
+        proxy.local_addr().unwrap(),
+        &url[slash..]
+    );
+    let holes: Arc<Mutex<Vec<Arc<AtomicBool>>>> = Arc::default();
+    tokio::spawn({
+        let holes = holes.clone();
+        async move {
+            loop {
+                let Ok((client, _)) = proxy.accept().await else {
+                    break;
+                };
+                let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else {
+                    continue;
+                };
+                let hole = Arc::new(AtomicBool::new(false));
+                let (mut cr, mut cw) = client.into_split();
+                let (mut sr, mut sw) = server.into_split();
+                tokio::spawn({
+                    let hole = hole.clone();
+                    let holes = holes.clone();
+                    async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let n = match cr.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            if buf[..n].windows(6).any(|w| w == b"LISTEN") {
+                                holes.lock().unwrap().push(hole.clone());
+                            }
+                            if hole.load(Ordering::SeqCst) {
+                                continue;
+                            }
+                            if sw.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    loop {
+                        let n = match sr.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        if hole.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        if cw.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    // A second replica whose every connection goes through the proxy, pinging
+    // itself every second so the test does not wait minutes.
+    let schema = h.schema.clone();
+    let proxied = PgPoolOptions::new()
+        .max_connections(8)
+        .after_connect(move |conn, _| {
+            let schema = schema.clone();
+            Box::pin(async move {
+                sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&proxied_url)
+        .await
+        .unwrap();
+    let (replica, handle) = spawn_server_with_ping(proxied, h.ct.child_token(), None, 1).await;
+    h.servers.push(handle);
+
+    let health = |base: String| async move {
+        reqwest::get(format!("{base}/health"))
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+    };
+    let wait_until = |pred: fn(&serde_json::Value) -> bool, what: &'static str| {
+        let replica = replica.clone();
+        async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let h = health(replica.clone()).await;
+                if pred(&h["events"]) {
+                    return h;
+                }
+                assert!(std::time::Instant::now() < deadline, "{what}: {h}");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    };
+    // The first echo is the proof of readiness the log line never was.
+    let ready = wait_until(|e| e["echoes"].as_u64() >= Some(1), "first echo").await;
+    assert_eq!(ready["events"]["listener"], "live", "{ready}");
+    assert_eq!(ready["events"]["attachments"], 1, "{ready}");
+    assert_eq!(ready["status"], "ok", "{ready}");
+
+    // A wake through the proxied replica works while its listener hears.
+    let wake = |replica: String, writer_base: String, key: &'static str| {
+        let token = token.clone();
+        let marta = marta.clone();
+        async move {
+            let waiter = connect(&replica, &marta).await;
+            let wait = tokio::spawn(async move {
+                let r = call(
+                    &waiter,
+                    "wait_for_updates",
+                    json!({"kinds": ["note"], "timeout_seconds": 10}),
+                )
+                .await;
+                let _ = waiter.cancel().await;
+                r
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let writer = connect(&writer_base, &token).await;
+            call(&writer, "set_note", json!({"key": key, "value": "x"})).await;
+            let _ = writer.cancel().await;
+            wait.await.unwrap()
+        }
+    };
+    let woke = wake(replica.clone(), h.base.clone(), "before").await;
+    assert_eq!(woke["woke"], true, "{woke}");
+
+    // The socket goes dead without a word. Every LISTEN connection the proxy
+    // has seen so far is black-holed; the one the replica opens next is not.
+    let dead: Vec<_> = holes.lock().unwrap().drain(..).collect();
+    assert!(!dead.is_empty(), "the proxy saw the LISTEN connection");
+    for hole in &dead {
+        hole.store(true, Ordering::SeqCst);
+    }
+
+    // The replica notices on its own, and comes back hearing.
+    let back = wait_until(
+        |e| e["attachments"].as_u64() >= Some(2) && e["listener"] == "live",
+        "reattached",
+    )
+    .await;
+    let echoes_at_reattach = back["events"]["echoes"].as_u64().unwrap();
+    wait_until(
+        |e| e["listener"] == "live" && e["last_echo_seconds"].as_i64() <= Some(2),
+        "hearing again",
+    )
+    .await;
+    let after = health(replica.clone()).await;
+    assert!(
+        after["events"]["echoes"].as_u64() >= Some(echoes_at_reattach),
+        "{after}"
+    );
+    assert_eq!(after["status"], "ok", "{after}");
+
+    // And wakes work again, on the fresh connection.
+    let woke = wake(replica.clone(), h.base.clone(), "after").await;
+    assert_eq!(woke["woke"], true, "after the reattach: {woke}");
+
+    h.shutdown().await;
+}
+
+/// An owner's seat is only an owner's to change. Re-inviting someone already
+/// seated changes their role on the spot, and a moderator used that to
+/// demote the owner to observer and then remove it, walking around "only an
+/// owner can remove another owner" (#133). The refusal leaves the owner's
+/// role, floor and binding exactly as they were; an owner re-inviting a
+/// moderator still changes its role.
+#[tokio::test]
+async fn a_moderator_cannot_demote_an_owner_by_reinviting_it() {
+    for backend in ["postgres", "jetstream"] {
+        let schema = format!("t_owner_seat_{backend}");
+        let h = require_db_broker!(&schema);
+        let token = seed_agent(&h.pool, "acme", "joaquin").await;
+        let reader_token = seed_agent(&h.pool, "acme", "dani").await;
+        enable_conversations(&h.pool, "acme").await;
+        if backend == "jetstream" {
+            route_team_to_jetstream(&h, "acme").await;
+        }
+        // The owner is a registered window, so its seat carries a binding
+        // the refusal has to leave alone.
+        let agent = connect(&h.base, &token).await;
+        let cred = call(&agent, "register_session", json!({"session": "owner"})).await;
+        let owner = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+        let reader = connect_with_session(&h.base, &reader_token, "reader").await;
+
+        let convo = call(
+            &owner,
+            "create_conversation",
+            json!({"title": "whose seat", "private": true}),
+        )
+        .await;
+        let cid = convo["id"].as_str().unwrap().to_owned();
+        let cid_uuid: Uuid = cid.parse().unwrap();
+        let first = call(
+            &owner,
+            "send_conversation_message",
+            json!({"conversation_id": cid, "body": "the owner's own thread",
+                   "request_id": request_id()}),
+        )
+        .await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "dani/reader", "role": "moderator"}),
+        )
+        .await;
+        call(
+            &reader,
+            "join_conversation",
+            json!({"conversation_id": cid}),
+        )
+        .await;
+
+        let seat = |session: &'static str| {
+            let pool = h.pool.clone();
+            async move {
+                sqlx::query_as::<_, (String, String, Option<i64>, Option<Uuid>)>(
+                    "SELECT role, state, history_from_seq, session_id
+                       FROM conversation_memberships
+                      WHERE conversation_id = $1 AND session = $2",
+                )
+                .bind(cid_uuid)
+                .bind(session)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let owner_seat = seat("owner").await;
+        assert_eq!(owner_seat.0, "owner", "[{backend}]");
+        assert!(
+            owner_seat.3.is_some(),
+            "[{backend}] the owner's seat is bound"
+        );
+
+        let err = call_expect_error(
+            &reader,
+            "remove_conversation_member",
+            json!({"conversation_id": cid, "address": "joaquin/owner"}),
+        )
+        .await;
+        assert!(
+            err.contains("only an owner can remove another owner"),
+            "[{backend}] {err}"
+        );
+
+        // Every role a moderator could hand out, and the default one.
+        for role in [
+            Some("observer"),
+            Some("participant"),
+            Some("moderator"),
+            None,
+        ] {
+            let mut args = json!({"conversation_id": cid, "address": "joaquin/owner"});
+            if let Some(role) = role {
+                args["role"] = json!(role);
+            }
+            let err = call_expect_error(&reader, "invite_to_conversation", args).await;
+            assert!(
+                err.contains("only an owner can change or remove another owner"),
+                "[{backend}] role {role:?}: {err}"
+            );
+            assert!(!err.contains("database error"), "[{backend}] {err}");
+            assert_eq!(
+                seat("owner").await,
+                owner_seat,
+                "[{backend}] role {role:?} changed the seat"
+            );
+            let seen = call(
+                &owner,
+                "get_conversation_message",
+                json!({"message_id": first}),
+            )
+            .await;
+            assert_eq!(seen["body"], "the owner's own thread", "[{backend}] {seen}");
+        }
+        let err = call_expect_error(
+            &reader,
+            "remove_conversation_member",
+            json!({"conversation_id": cid, "address": "joaquin/owner"}),
+        )
+        .await;
+        assert!(
+            err.contains("only an owner can remove another owner"),
+            "[{backend}] {err}"
+        );
+        let read = call(&owner, "read_conversation", json!({"conversation_id": cid})).await;
+        assert_eq!(
+            read["messages"].as_array().map(Vec::len),
+            Some(1),
+            "[{backend}] {read}"
+        );
+
+        // The ordinary path is untouched: an owner re-inviting a moderator
+        // changes its role, and nothing else about its seat.
+        let reader_seat = seat("reader").await;
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "dani/reader", "role": "observer"}),
+        )
+        .await;
+        let demoted = seat("reader").await;
+        assert_eq!(demoted.0, "observer", "[{backend}] {demoted:?}");
+        assert_eq!(
+            (&demoted.1, demoted.2, demoted.3),
+            (&reader_seat.1, reader_seat.2, reader_seat.3),
+            "[{backend}] state, floor and binding stay"
+        );
+        let read = call(
+            &reader,
+            "read_conversation",
+            json!({"conversation_id": cid}),
+        )
+        .await;
+        assert!(read["messages"].is_array(), "[{backend}] {read}");
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "dani/reader", "role": "moderator"}),
+        )
+        .await;
+
+        // A transfer proposal is an owner seat in the `invited` state, and
+        // it is not the moderator's to reshape either.
+        let cred2 = call(&agent, "register_session", json!({"session": "owner-2"})).await;
+        let successor = connect(&h.base, cred2["session_token"].as_str().unwrap()).await;
+        let proposal = call(
+            &owner,
+            "transfer_membership",
+            json!({"conversation_id": cid, "to": "joaquin/owner-2"}),
+        )
+        .await;
+        assert_eq!(proposal["state"], "proposed", "[{backend}] {proposal}");
+        let proposed_seat = seat("owner-2").await;
+        assert_eq!(
+            (proposed_seat.0.as_str(), proposed_seat.1.as_str()),
+            ("owner", "invited"),
+            "[{backend}] {proposed_seat:?}"
+        );
+        let err = call_expect_error(
+            &reader,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "joaquin/owner-2", "role": "observer"}),
+        )
+        .await;
+        assert!(
+            err.contains("only an owner can change or remove another owner"),
+            "[{backend}] {err}"
+        );
+        assert_eq!(seat("owner-2").await, proposed_seat, "[{backend}]");
+
+        // A storm: the moderator hammers both owner seats from a dozen
+        // connections while the owner keeps flipping the moderator's role.
+        // Whatever the interleaving, no attempt lands on an owner seat, and
+        // none dies of a deadlock, which would surface as "database error".
+        let owner_token = cred["session_token"].as_str().unwrap().to_owned();
+        let mut storm = Vec::new();
+        for i in 0..12usize {
+            let base = h.base.clone();
+            let reader_token = reader_token.clone();
+            let cid = cid.clone();
+            storm.push(tokio::spawn(async move {
+                let c = connect_with_session(&base, &reader_token, "reader").await;
+                let target = if i % 2 == 0 {
+                    "joaquin/owner"
+                } else {
+                    "joaquin/owner-2"
+                };
+                let role = ["observer", "participant", "moderator"][i % 3];
+                let args: serde_json::Map<String, Value> = serde_json::from_value(
+                    json!({"conversation_id": cid, "address": target, "role": role}),
+                )
+                .unwrap();
+                let outcome = c
+                    .call_tool(
+                        CallToolRequestParams::new("invite_to_conversation").with_arguments(args),
+                    )
+                    .await;
+                let _ = c.cancel().await;
+                match outcome {
+                    Ok(res) if res.is_error != Some(true) => {
+                        Err(format!("{target} as {role} went through"))
+                    }
+                    Ok(res) => Ok(format!("{:?}", res.content)),
+                    Err(e) => Ok(e.to_string()),
+                }
+            }));
+        }
+        for i in 0..4usize {
+            let base = h.base.clone();
+            let owner_token = owner_token.clone();
+            let cid = cid.clone();
+            storm.push(tokio::spawn(async move {
+                let c = connect(&base, &owner_token).await;
+                let role = if i % 2 == 0 { "observer" } else { "moderator" };
+                call(
+                    &c,
+                    "invite_to_conversation",
+                    json!({"conversation_id": cid, "address": "dani/reader", "role": role}),
+                )
+                .await;
+                let _ = c.cancel().await;
+                Ok::<String, String>(String::new())
+            }));
+        }
+        for task in storm {
+            let outcome = task.await.unwrap();
+            let text = outcome.unwrap_or_else(|landed| panic!("[{backend}] {landed}"));
+            assert!(!text.contains("database error"), "[{backend}] {text}");
+        }
+        assert_eq!(
+            seat("owner").await,
+            owner_seat,
+            "[{backend}] the owner's seat survived the storm"
+        );
+        assert_eq!(
+            seat("owner-2").await,
+            proposed_seat,
+            "[{backend}] so did the proposed one"
+        );
+
+        // The proposal still completes for the window it was made to.
+        call(
+            &successor,
+            "join_conversation",
+            json!({"conversation_id": cid}),
+        )
+        .await;
+        assert_eq!(seat("owner-2").await.1, "active", "[{backend}]");
+        assert_eq!(
+            seat("owner").await.1,
+            "left",
+            "[{backend}] the source is superseded"
+        );
+
+        for c in [agent, owner, successor, reader] {
+            let _ = c.cancel().await;
+        }
+        h.shutdown().await;
+    }
+}
+
+/// A claim whose lease lapsed is open, and every read says so at once: the
+/// writers always treated it that way (anyone could claim it), while
+/// get_task and list_tasks kept reporting "claimed by marta", the open list
+/// left it out and the claimed list kept it (#135).
+#[tokio::test]
+async fn a_lapsed_lease_reads_as_open_everywhere() {
+    let h = require_db!("t_lapsed_lease");
+    let a = seed_agent(&h.pool, "acme", "marta").await;
+    let b = seed_agent(&h.pool, "acme", "dani").await;
+    let marta = connect(&h.base, &a).await;
+    let dani = connect(&h.base, &b).await;
+
+    call(
+        &marta,
+        "create_task",
+        json!({"key": "lapse", "title": "long job"}),
+    )
+    .await;
+    call(
+        &marta,
+        "create_task",
+        json!({"key": "still-open", "title": "untouched"}),
+    )
+    .await;
+    let claimed = call(
+        &marta,
+        "claim_task",
+        json!({"key": "lapse", "lease_seconds": 60}),
+    )
+    .await;
+    assert_eq!(claimed["claimed"], true, "{claimed}");
+
+    // Live: claimed by marta, with time left, nobody lapsed.
+    let live = call(&dani, "get_task", json!({"key": "lapse"})).await["task"].clone();
+    assert_eq!(live["status"], "claimed", "{live}");
+    assert_eq!(live["claimed_by"], "marta", "{live}");
+    assert_eq!(live["lease_expired"], false, "{live}");
+    assert!(live["lapsed_holder"].is_null(), "{live}");
+    assert!(
+        live["lease_seconds_remaining"].as_i64().unwrap_or(0) > 0,
+        "{live}"
+    );
+    let mine = call(&marta, "list_tasks", json!({"mine_only": true})).await;
+    assert_eq!(mine["tasks"].as_array().map(Vec::len), Some(1), "{mine}");
+    let listed = call(&dani, "list_tasks", json!({})).await;
+    assert_eq!(
+        (listed["open"].as_i64(), listed["claimed"].as_i64()),
+        (Some(1), Some(1)),
+        "{listed}"
+    );
+
+    sqlx::query(
+        "UPDATE tasks SET lease_expires_at = now() - interval '1 minute' WHERE key = 'lapse'",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    // Lapsed: open, unheld, and honest about who let it go.
+    let lapsed = call(&dani, "get_task", json!({"key": "lapse"})).await["task"].clone();
+    assert_eq!(lapsed["status"], "open", "{lapsed}");
+    assert!(lapsed["claimed_by"].is_null(), "{lapsed}");
+    assert!(lapsed["claimed_session"].is_null(), "{lapsed}");
+    assert!(lapsed["claimed_at"].is_null(), "{lapsed}");
+    assert!(lapsed["lease_expires_at"].is_null(), "{lapsed}");
+    assert!(lapsed["lease_seconds_remaining"].is_null(), "{lapsed}");
+    assert_eq!(lapsed["lease_expired"], true, "{lapsed}");
+    assert_eq!(lapsed["lapsed_holder"], "marta", "{lapsed}");
+
+    let keys = |r: &Value| -> Vec<String> {
+        r["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["key"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let open = call(&dani, "list_tasks", json!({"status": "open"})).await;
+    assert!(
+        keys(&open).contains(&"lapse".to_owned()),
+        "the open list has it: {open}"
+    );
+    assert!(
+        open["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["status"] == "open"),
+        "and every row in it says open: {open}"
+    );
+    let claimed = call(&dani, "list_tasks", json!({"status": "claimed"})).await;
+    assert!(
+        !keys(&claimed).contains(&"lapse".to_owned()),
+        "the claimed list does not: {claimed}"
+    );
+    let all = call(&dani, "list_tasks", json!({})).await;
+    let row = all["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["key"] == "lapse")
+        .unwrap();
+    assert_eq!(row["status"], "open", "{all}");
+    assert_eq!(row["lapsed_holder"], "marta", "{all}");
+    assert_eq!(
+        (all["open"].as_i64(), all["claimed"].as_i64()),
+        (Some(2), Some(0)),
+        "counters follow: {all}"
+    );
+    let mine = call(&marta, "list_tasks", json!({"mine_only": true})).await;
+    assert_eq!(
+        mine["tasks"].as_array().map(Vec::len),
+        Some(0),
+        "a lapsed lease is nobody's: {mine}"
+    );
+
+    // Renewing what lapsed is refused with the way back in; claiming works,
+    // for the former holder as for anyone else.
+    let err = call_expect_error(&marta, "renew_task_lease", json!({"key": "lapse"})).await;
+    assert!(err.contains("lapsed"), "{err}");
+    assert!(err.contains("claim it again"), "{err}");
+    let taken = call(&dani, "claim_task", json!({"key": "lapse"})).await;
+    assert_eq!(taken["claimed"], true, "{taken}");
+    let now = taken["task"].clone();
+    assert_eq!(now["status"], "claimed", "{now}");
+    assert_eq!(now["claimed_by"], "dani", "{now}");
+    assert_eq!(now["lease_expired"], false, "{now}");
+    assert!(now["lapsed_holder"].is_null(), "{now}");
+
+    // A claim with no expiry at all (a row from before leases had one) is a
+    // live claim: it reads as claimed, counts as its holder's, and never
+    // trips the lapse logic.
+    sqlx::query("UPDATE tasks SET lease_expires_at = NULL WHERE key = 'lapse'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let legacy = call(&dani, "get_task", json!({"key": "lapse"})).await["task"].clone();
+    assert_eq!(legacy["status"], "claimed", "{legacy}");
+    assert_eq!(legacy["claimed_by"], "dani", "{legacy}");
+    assert_eq!(legacy["lease_expired"], false, "{legacy}");
+    let mine = call(
+        &dani,
+        "list_tasks",
+        json!({"mine_only": true, "status": "claimed"}),
+    )
+    .await;
+    assert_eq!(mine["tasks"].as_array().map(Vec::len), Some(1), "{mine}");
+
+    for c in [marta, dani] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Revoking an agent token takes its session credentials with it. Auth
+/// already refused them, but their rows still read as live: recovery
+/// counted a window that could not answer and the label stayed reserved
+/// for a credential that no longer worked, until it expired a day later
+/// (#137). A genuinely live window under another token still protects.
+#[tokio::test]
+async fn a_revoked_token_takes_its_sessions_with_it() {
+    use ai_crew_sync::auth::{generate_token, hash_token, token_prefix};
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_revoked_parent");
+    let token_a = seed_agent(&h.pool, "acme", "joaquin").await;
+    enable_conversations(&h.pool, "acme").await;
+    // A second credential for the same agent: the replacement.
+    let (agent_id,): (Uuid,) = sqlx::query_as("SELECT id FROM agents WHERE name = 'joaquin'")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    let token_b = generate_token();
+    sqlx::query("INSERT INTO api_tokens (agent_id, token_hash, prefix) VALUES ($1, $2, $3)")
+        .bind(agent_id)
+        .bind(hash_token(&token_b))
+        .bind(token_prefix(&token_b))
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (token_a_id,): (Uuid,) = sqlx::query_as("SELECT id FROM api_tokens WHERE token_hash = $1")
+        .bind(hash_token(&token_a))
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+
+    let a = connect(&h.base, &token_a).await;
+    let cred = call(
+        &a,
+        "register_session",
+        json!({"session": "only-window", "ttl_seconds": 3600}),
+    )
+    .await;
+    let window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let convo = call(
+        &window,
+        "create_conversation",
+        json!({"title": "mine alone", "private": true}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(
+        &window,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "before the rotation", "request_id": request_id()}),
+    )
+    .await;
+
+    // While the window lives, the replacement token recovers nothing.
+    let b = connect(&h.base, &token_b).await;
+    let err = call_expect_error(
+        &b,
+        "recover_conversation_history",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("still live"), "{err}");
+
+    // The operator revokes the first token (the CLI and the admin API share
+    // this call).
+    store::revoke_token(&h.pool, Actor::Cli, None, token_a_id)
+        .await
+        .unwrap();
+    let (detail,): (serde_json::Value,) = sqlx::query_as(
+        "SELECT detail FROM admin_audit WHERE action = 'token.revoke' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        detail["sessions_revoked"],
+        json!(["only-window"]),
+        "{detail}"
+    );
+
+    // The window's credential is dead, as before.
+    let status = mcp_status(&h.base, cred["session_token"].as_str().unwrap()).await;
+    assert_eq!(status, 401, "the child credential is refused");
+
+    // And now the rows agree with authentication: recovery works, the
+    // label is free, the old secret stays dead.
+    let recovered = call(
+        &b,
+        "recover_conversation_history",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert_eq!(
+        recovered["messages"][0]["body"], "before the rotation",
+        "{recovered}"
+    );
+    let again = call(
+        &b,
+        "register_session",
+        json!({"session": "only-window", "ttl_seconds": 3600}),
+    )
+    .await;
+    assert!(again["session_token"].is_string(), "{again}");
+    assert_eq!(
+        mcp_status(&h.base, cred["session_token"].as_str().unwrap()).await,
+        401,
+        "re-registering the label does not revive the old secret"
+    );
+
+    // A window that is genuinely live, under the replacement token, still
+    // blocks recovery: the rule protects windows that can answer.
+    let err = call_expect_error(
+        &b,
+        "recover_conversation_history",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("still live"), "{err}");
+
+    // The races, replayed deterministically at the store: a request that
+    // authenticated with token A before the revocation and runs after it.
+    use ai_crew_sync::auth::AuthCtx;
+    use ai_crew_sync::store::sessions;
+    let team = team_id(&h.pool, "acme").await;
+    let stale_agent = AuthCtx {
+        agent_id,
+        agent_name: "joaquin".into(),
+        team_id: team,
+        team_slug: "acme".into(),
+        session: String::new(),
+        session_id: None,
+        session_epoch: None,
+        token_id: Some(token_a_id),
+    };
+    let err = match sessions::register(&h.pool, &stale_agent, token_a_id, "late-window", None).await
+    {
+        Ok(_) => panic!("a registration under a revoked token must not land"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("revoked while it was in flight"),
+        "{err}"
+    );
+    let (late,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM agent_sessions WHERE agent_id = $1 AND label = 'late-window'",
+    )
+    .bind(agent_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(late, 0, "no row was written");
+
+    // And a request that authenticated with the old window's credential,
+    // running after B re-registered the label: it must not rotate B's row.
+    let (row_id, epoch_now): (Uuid, i64) = sqlx::query_as(
+        "SELECT id, epoch FROM agent_sessions WHERE agent_id = $1 AND label = 'only-window'",
+    )
+    .bind(agent_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let stale_window = AuthCtx {
+        agent_id,
+        agent_name: "joaquin".into(),
+        team_id: team,
+        team_slug: "acme".into(),
+        session: "only-window".into(),
+        session_id: Some(row_id),
+        session_epoch: Some(epoch_now - 1),
+        token_id: None,
+    };
+    let err = match sessions::resume(&h.pool, &stale_window, None).await {
+        Ok(_) => panic!("a stale connection must not rotate the new window's credential"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("re-registered"), "{err}");
+    let err = match sessions::renew(&h.pool, &stale_window, None).await {
+        Ok(_) => panic!("a stale connection must not extend the new window's credential"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("revoked"), "{err}");
+    assert_eq!(
+        mcp_status(&h.base, again["session_token"].as_str().unwrap()).await,
+        200,
+        "B's window still works"
+    );
+
+    // Revocation over the admin API, with a team-scoped credential, sweeps
+    // the sessions the same way; another team's credential cannot reach it.
+    let token_c = generate_token();
+    let (token_c_id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO api_tokens (agent_id, token_hash, prefix) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(agent_id)
+    .bind(hash_token(&token_c))
+    .bind(token_prefix(&token_c))
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let c = connect(&h.base, &token_c).await;
+    let other = call(&c, "register_session", json!({"session": "other-window"})).await;
+    let other_token = other["session_token"].as_str().unwrap().to_owned();
+    seed_agent(&h.pool, "rivals", "eve").await;
+    let rivals = team_id(&h.pool, "rivals").await;
+    let foreign = store::grant_admin(&h.pool, Actor::Cli, Some(rivals), None)
+        .await
+        .unwrap();
+    let (status, _) = Admin::new(&h.base, &foreign.token)
+        .delete(&format!("/teams/acme/tokens/{token_c_id}"))
+        .await;
+    assert_eq!(status, 403, "another team's credential is refused");
+    let ours = store::grant_admin(&h.pool, Actor::Cli, Some(team), None)
+        .await
+        .unwrap();
+    let (status, _) = Admin::new(&h.base, &ours.token)
+        .delete(&format!("/teams/acme/tokens/{token_c_id}"))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(mcp_status(&h.base, &other_token).await, 401);
+    let (swept,): (bool,) = sqlx::query_as(
+        "SELECT revoked_at IS NOT NULL FROM agent_sessions WHERE agent_id = $1 AND label = 'other-window'",
+    )
+    .bind(agent_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert!(swept, "the session row is revoked with its parent");
+
+    for cl in [a, window, b, c] {
+        let _ = cl.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// The agent lock the lifecycle paths serialise on must not conflict with
+/// the key share a foreign key takes. A first heartbeat holds `FOR SHARE`
+/// on its session (the epoch guard) and then inserts presence, which needs
+/// `FOR KEY SHARE` on the agent; a revocation holding `FOR UPDATE` on the
+/// agent and waiting on that session row closed the cycle, and Postgres
+/// rolled the revocation back with 40P01. `FOR NO KEY UPDATE` serialises
+/// the lifecycle paths without blocking the key share.
+#[tokio::test]
+async fn a_revocation_does_not_deadlock_with_a_first_heartbeat() {
+    use ai_crew_sync::auth::hash_token;
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_revoke_vs_heartbeat");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let (agent_id, token_id): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT a.id, t.id FROM api_tokens t JOIN agents a ON a.id = t.agent_id
+          WHERE t.token_hash = $1",
+    )
+    .bind(hash_token(&token))
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let agent = connect(&h.base, &token).await;
+    let cred = call(&agent, "register_session", json!({"session": "first"})).await;
+    let session_id: Uuid = cred["session_id"].as_str().unwrap().parse().unwrap();
+
+    // The heartbeat's transaction, paused right after the guard.
+    let mut heartbeat = h.pool.begin().await.unwrap();
+    sqlx::query("SELECT epoch FROM agent_sessions WHERE id = $1 FOR SHARE")
+        .bind(session_id)
+        .fetch_one(&mut *heartbeat)
+        .await
+        .unwrap();
+
+    // The revocation takes the agent lock and waits on that session row.
+    let revoke = tokio::spawn({
+        let pool = h.pool.clone();
+        async move { store::revoke_token(&pool, Actor::Cli, None, token_id).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        !revoke.is_finished(),
+        "the revocation waits for the guarded transaction"
+    );
+
+    // The heartbeat inserts presence, which needs a key share on the agent.
+    sqlx::query(
+        "INSERT INTO agent_presence (agent_id, session, status, updated_at, expires_at)
+         VALUES ($1, 'first', 'active', now(), now() + interval '15 minutes')",
+    )
+    .bind(agent_id)
+    .execute(&mut *heartbeat)
+    .await
+    .expect("the first heartbeat lands while a revocation waits");
+    heartbeat.commit().await.unwrap();
+
+    revoke
+        .await
+        .unwrap()
+        .expect("the revocation completes once the heartbeat commits");
+    let (revoked,): (bool,) =
+        sqlx::query_as("SELECT revoked_at IS NOT NULL FROM agent_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(revoked, "and it swept the session");
+
+    let _ = agent.cancel().await;
+    h.shutdown().await;
+}
+
+/// Revoking a project grant takes effect at once, threads being read
+/// included: an active seat in a project thread is not a second door. The
+/// revoked agent reads nothing new, gets no new receipt or inbox reference,
+/// cannot accept a pending invitation, and a project reader without a seat
+/// is shut out the same way. Private threads keep their membership rules.
+#[tokio::test]
+async fn audit_project_revocation_closes_an_active_members_access() {
+    let h = require_db!("t_project_revocation");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    let carol_token = seed_agent(&h.pool, "acme", "carol").await;
+    let dave_token = seed_agent(&h.pool, "acme", "dave").await;
+    enable_conversations(&h.pool, "acme").await;
+    let alice = connect_with_session(&h.base, &alice_token, "lead").await;
+    // Bob is a registered window, so the inbox path is exercised too.
+    let bob_agent = connect(&h.base, &bob_token).await;
+    let bob_cred = call(&bob_agent, "register_session", json!({"session": "reader"})).await;
+    let bob = connect(&h.base, bob_cred["session_token"].as_str().unwrap()).await;
+    let carol = connect_with_session(&h.base, &carol_token, "peek").await;
+    let dave = connect_with_session(&h.base, &dave_token, "late").await;
+
+    call(&alice, "create_project", json!({"project": "audit"})).await;
+    for who in ["bob", "carol", "dave"] {
+        call(
+            &alice,
+            "grant_project_access",
+            json!({"project": "audit", "agent": who}),
+        )
+        .await;
+    }
+    let convo = call(
+        &alice,
+        "create_conversation",
+        json!({"title": "audit thread", "project": "audit", "invite": ["bob/reader", "dave/late"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&bob, "join_conversation", json!({"conversation_id": cid})).await;
+    let before = call(
+        &alice,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "while Bob still had access", "request_id": request_id()}),
+    )
+    .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let seen = call(
+        &bob,
+        "get_conversation_message",
+        json!({"message_id": before}),
+    )
+    .await;
+    assert_eq!(seen["body"], "while Bob still had access", "{seen}");
+    let seen = call(
+        &carol,
+        "get_conversation_message",
+        json!({"message_id": before}),
+    )
+    .await;
+    assert_eq!(
+        seen["body"], "while Bob still had access",
+        "a project reader: {seen}"
+    );
+
+    // The revocations.
+    for who in ["bob", "carol", "dave"] {
+        call(
+            &alice,
+            "grant_project_access",
+            json!({"project": "audit", "agent": who, "grant": false}),
+        )
+        .await;
+    }
+    let after = call(
+        &alice,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "after Bob lost access", "request_id": request_id()}),
+    )
+    .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The active member reads nothing, new or old, and cannot write.
+    for (who, client) in [("bob", &bob), ("carol", &carol)] {
+        let err =
+            call_expect_error(client, "read_conversation", json!({"conversation_id": cid})).await;
+        assert!(!err.contains("database error"), "{who}: {err}");
+        for m in [&before, &after] {
+            let err =
+                call_expect_error(client, "get_conversation_message", json!({"message_id": m}))
+                    .await;
+            assert!(!err.contains("database error"), "{who}: {err}");
+        }
+    }
+    let err = call_expect_error(
+        &bob,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "still here?", "request_id": request_id()}),
+    )
+    .await;
+    assert!(!err.contains("database error"), "{err}");
+    let err = call_expect_error(
+        &bob,
+        "ack_message",
+        json!({"conversation_id": cid, "message_id": after, "resolved": false}),
+    )
+    .await;
+    assert!(!err.contains("database error"), "{err}");
+
+    // No new obligation: the message sent after the revocation has no
+    // receipt for Bob, and his inbox hands him nothing from this thread.
+    let receipts = call(&alice, "get_message_receipts", json!({"message_id": after})).await;
+    assert!(
+        !receipts["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["address"].as_str().unwrap_or("").starts_with("bob")),
+        "no receipt for the revoked seat: {receipts}"
+    );
+    let inbox = call(&bob, "fetch_conversation_inbox", json!({})).await;
+    assert!(
+        inbox["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["conversation_id"] != cid.as_str()),
+        "nothing from the project thread is handed out: {inbox}"
+    );
+
+    // Nor is the seat told anything about the thread: no unread activity
+    // to wake on, nothing counted as undelivered.
+    let woke = call(
+        &bob,
+        "wait_for_conversation_updates",
+        json!({"timeout_seconds": 1}),
+    )
+    .await;
+    assert!(
+        woke["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["conversation_id"] != cid.as_str()),
+        "a revoked seat is not woken: {woke}"
+    );
+    let status = call(&bob, "conversation_inbox_status", json!({})).await;
+    assert_eq!(status["undelivered"], 0, "{status}");
+
+    // A pending invitation cannot be accepted after the revocation.
+    let err = call_expect_error(&dave, "join_conversation", json!({"conversation_id": cid})).await;
+    assert!(err.contains("revoked"), "{err}");
+
+    // Granting it back reopens the seat: the membership was never removed.
+    call(
+        &alice,
+        "grant_project_access",
+        json!({"project": "audit", "agent": "bob"}),
+    )
+    .await;
+    let seen = call(
+        &bob,
+        "get_conversation_message",
+        json!({"message_id": after}),
+    )
+    .await;
+    assert_eq!(seen["body"], "after Bob lost access", "{seen}");
+
+    // A private thread is untouched by project grants.
+    let private = call(
+        &alice,
+        "create_conversation",
+        json!({"title": "private", "private": true, "invite": ["bob/reader"]}),
+    )
+    .await;
+    let pid = private["id"].as_str().unwrap().to_owned();
+    call(&bob, "join_conversation", json!({"conversation_id": pid})).await;
+    call(
+        &alice,
+        "grant_project_access",
+        json!({"project": "audit", "agent": "bob", "grant": false}),
+    )
+    .await;
+    let pm = call(
+        &alice,
+        "send_conversation_message",
+        json!({"conversation_id": pid, "body": "private still works", "request_id": request_id()}),
+    )
+    .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let seen = call(&bob, "get_conversation_message", json!({"message_id": pm})).await;
+    assert_eq!(seen["body"], "private still works", "{seen}");
+
+    for c in [alice, bob_agent, bob, carol, dave] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// The same promise on the broker path: a reference published to JetStream
+/// before the revocation is not handed to the revoked seat, so the
+/// guarantee does not depend on which backend holds the thread.
+#[tokio::test]
+async fn audit_project_revocation_holds_on_the_broker_path() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::{inbox, outbox};
+    let h = require_db_broker!("t_project_revocation_js");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    JetStreamBackend::provision_inbox(&config, team)
+        .await
+        .unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+    // The test server runs no publication worker: the outbox and the inbox
+    // references are drained by hand, exactly as the other broker tests do.
+    let publish = || async {
+        assert_eq!(
+            outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+            Some(outbox::Settled::Stored)
+        );
+        inbox::publish_pending(&h.pool, &backend, team, 100)
+            .await
+            .unwrap()
+    };
+    let alice = connect_with_session(&h.base, &alice_token, "lead").await;
+    let bob_agent = connect(&h.base, &bob_token).await;
+    let bob_cred = call(&bob_agent, "register_session", json!({"session": "reader"})).await;
+    let bob = connect(&h.base, bob_cred["session_token"].as_str().unwrap()).await;
+
+    call(&alice, "create_project", json!({"project": "audit"})).await;
+    call(
+        &alice,
+        "grant_project_access",
+        json!({"project": "audit", "agent": "bob"}),
+    )
+    .await;
+    let convo = call(
+        &alice,
+        "create_conversation",
+        json!({"title": "audit thread", "project": "audit", "invite": ["bob/reader"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&bob, "join_conversation", json!({"conversation_id": cid})).await;
+
+    // A first message proves the broker path is live for this seat.
+    call(
+        &alice,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "first", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(publish().await, 1, "one reference for Bob");
+    let batch = call(&bob, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(batch["from_broker"], 1, "{batch}");
+    assert_eq!(batch["references"][0]["conversation_id"], cid, "{batch}");
+    let ids: Vec<&str> = batch["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["delivery_id"].as_str())
+        .collect();
+    call(&bob, "confirm_inbox_delivery", json!({"delivery_ids": ids})).await;
+
+    // A second message reaches the broker while Bob still has the grant;
+    // then the grant goes.
+    call(
+        &alice,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "second", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(publish().await, 1, "the second reference is on the broker");
+    call(
+        &alice,
+        "grant_project_access",
+        json!({"project": "audit", "agent": "bob", "grant": false}),
+    )
+    .await;
+    for _ in 0..3 {
+        let batch = call(&bob, "fetch_conversation_inbox", json!({})).await;
+        assert!(
+            batch["references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["conversation_id"] != cid.as_str()),
+            "the broker handed a project reference to a revoked seat: {batch}"
+        );
+    }
+    let status = call(&bob, "conversation_inbox_status", json!({})).await;
+    assert_eq!(status["undelivered"], 0, "{status}");
+
+    for c in [alice, bob_agent, bob] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Listing obeys the same rules as opening: a private seat taken by a
+/// registered window is not listed to the parent token wearing its label,
+/// a project grant lists project threads only, and a thread that becomes
+/// inaccessible between the candidate query and its read is skipped rather
+/// than failing the whole listing (#149).
+#[tokio::test]
+async fn audit_list_skips_an_authenticated_seat_for_parent_label() {
+    let h = require_db!("t_list_candidates");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    enable_conversations(&h.pool, "acme").await;
+    let alice_agent = connect(&h.base, &alice_token).await;
+    let cred = call(
+        &alice_agent,
+        "register_session",
+        json!({"session": "window"}),
+    )
+    .await;
+    let window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let bob = connect_with_session(&h.base, &bob_token, "bob-win").await;
+
+    // A private thread the registered window owns, and a project thread
+    // Alice's shared session can list by grant.
+    let private = call(
+        &window,
+        "create_conversation",
+        json!({"title": "window's own", "private": true}),
+    )
+    .await;
+    let private_id = private["id"].as_str().unwrap().to_owned();
+    call(&window, "create_project", json!({"project": "shared"})).await;
+    let project = call(
+        &window,
+        "create_conversation",
+        json!({"title": "project thread", "project": "shared"}),
+    )
+    .await;
+    let project_id = project["id"].as_str().unwrap().to_owned();
+
+    // The parent token wearing the window's label: the private seat is the
+    // window's, the project thread is readable by grant. The listing must
+    // succeed and omit the seat it cannot open.
+    let impostor = connect_with_session(&h.base, &alice_token, "window").await;
+    let listed = call(&impostor, "list_conversations", json!({})).await;
+    let ids: Vec<&str> = listed["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        !ids.contains(&private_id.as_str()),
+        "the window's private seat is not the label's: {listed}"
+    );
+    assert!(
+        ids.contains(&project_id.as_str()),
+        "the project thread is listed by grant: {listed}"
+    );
+    let err = call_expect_error(
+        &impostor,
+        "read_conversation",
+        json!({"conversation_id": private_id}),
+    )
+    .await;
+    assert!(!err.contains("database error"), "{err}");
+
+    // A legacy row that combines a project with private visibility is
+    // still private: the grant lists nothing there.
+    let legacy = call(
+        &window,
+        "create_conversation",
+        json!({"title": "legacy private", "private": true}),
+    )
+    .await;
+    let legacy_id: Uuid = legacy["id"].as_str().unwrap().parse().unwrap();
+    let (project_uuid,): (Uuid,) =
+        sqlx::query_as("SELECT project_id FROM conversations WHERE id = $1")
+            .bind(project_id.parse::<Uuid>().unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE conversations SET project_id = $2 WHERE id = $1")
+        .bind(legacy_id)
+        .bind(project_uuid)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    call(
+        &window,
+        "grant_project_access",
+        json!({"project": "shared", "agent": "bob"}),
+    )
+    .await;
+    let listed = call(&bob, "list_conversations", json!({})).await;
+    let ids: Vec<&str> = listed["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&project_id.as_str()), "{listed}");
+    assert!(
+        !ids.contains(&legacy_id.to_string().as_str()),
+        "a private thread naming a project stays private: {listed}"
+    );
+
+    // Access lost between candidates and reads does not fail the listing:
+    // Bob's grant is revoked while he holds an invitation to the project
+    // thread, and the listing still returns what he may see.
+    call(
+        &window,
+        "invite_to_conversation",
+        json!({"conversation_id": project_id, "address": "bob/bob-win"}),
+    )
+    .await;
+    call(
+        &window,
+        "grant_project_access",
+        json!({"project": "shared", "agent": "bob", "grant": false}),
+    )
+    .await;
+    let listed = call(&bob, "list_conversations", json!({})).await;
+    assert!(
+        listed["conversations"].is_array(),
+        "the listing answers: {listed}"
+    );
+    assert!(
+        !listed["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == project_id.as_str()),
+        "a project thread is not listed without the project: {listed}"
+    );
+
+    for c in [alice_agent, window, impostor, bob] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// A cursor read drains the backlog oldest first. Taking the newest page
+/// and moving the cursor past it lost every unread message older than the
+/// page, in every scope (#146). History reads keep returning the last N.
+#[tokio::test]
+async fn audit_only_new_pagination_does_not_skip_unread_messages() {
+    let h = require_db!("t_only_new_pages");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    let alice = connect(&h.base, &alice_token).await;
+    let bob = connect(&h.base, &bob_token).await;
+    let bodies = |r: &Value| -> Vec<String> {
+        r["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["body"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // Inbox: three DMs, pages of two.
+    for body in ["oldest", "middle", "newest"] {
+        call(&alice, "post_message", json!({"to": "bob", "body": body})).await;
+    }
+    let page = call(
+        &bob,
+        "read_messages",
+        json!({"scope": "inbox", "only_new": true, "limit": 2}),
+    )
+    .await;
+    assert_eq!(bodies(&page), ["oldest", "middle"], "{page}");
+    assert_eq!(page["truncated"], true, "{page}");
+    // A message that arrives between pages lands on a later page, not lost.
+    call(
+        &alice,
+        "post_message",
+        json!({"to": "bob", "body": "latest"}),
+    )
+    .await;
+    let page = call(
+        &bob,
+        "read_messages",
+        json!({"scope": "inbox", "only_new": true, "limit": 2}),
+    )
+    .await;
+    assert_eq!(bodies(&page), ["newest", "latest"], "{page}");
+    let page = call(
+        &bob,
+        "read_messages",
+        json!({"scope": "inbox", "only_new": true, "limit": 2}),
+    )
+    .await;
+    assert!(bodies(&page).is_empty(), "drained: {page}");
+    // History still means the last N, oldest first within the page.
+    let last = call(
+        &bob,
+        "read_messages",
+        json!({"scope": "inbox", "only_new": false, "limit": 2}),
+    )
+    .await;
+    assert_eq!(bodies(&last), ["newest", "latest"], "{last}");
+
+    // Channel and all scopes: five messages, pages of two, nothing skipped.
+    call(&alice, "create_channel", json!({"name": "pages"})).await;
+    for i in 1..=5 {
+        call(
+            &alice,
+            "post_message",
+            json!({"channel": "pages", "body": format!("c{i}")}),
+        )
+        .await;
+    }
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let page = call(
+            &bob,
+            "read_messages",
+            json!({"scope": "pages", "only_new": true, "limit": 2}),
+        )
+        .await;
+        seen.extend(bodies(&page));
+    }
+    assert_eq!(
+        seen,
+        ["c1", "c2", "c3", "c4", "c5"],
+        "every channel message, in order"
+    );
+    // Another window of Bob has its own cursor and starts from the top.
+    let other = connect_with_session(&h.base, &bob_token, "other").await;
+    let page = call(
+        &other,
+        "read_messages",
+        json!({"scope": "pages", "only_new": true, "limit": 2}),
+    )
+    .await;
+    assert_eq!(bodies(&page), ["c1", "c2"], "independent cursor: {page}");
+    // The cross-session view keeps its own cursor too.
+    let all = call(
+        &bob,
+        "read_messages",
+        json!({"scope": "all", "only_new": true, "all_sessions": true, "limit": 3}),
+    )
+    .await;
+    assert_eq!(bodies(&all).len(), 3, "{all}");
+    assert_eq!(all["truncated"], true, "{all}");
+    let all_first = bodies(&all);
+    let all2 = call(
+        &bob,
+        "read_messages",
+        json!({"scope": "all", "only_new": true, "all_sessions": true, "limit": 3}),
+    )
+    .await;
+    assert!(
+        bodies(&all2).iter().all(|b| !all_first.contains(b)),
+        "the next page is new: {all2}"
+    );
+
+    for c in [alice, bob, other] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// revoke_session is fenced like resume and renew: a request admitted with
+/// a credential that was rotated before it ran must not close the window
+/// that replaced it, nor a sibling, while an agent token still closes a
+/// dead window and the label registers again afterwards (#148).
+#[tokio::test]
+async fn audit_a_stale_session_cannot_revoke_its_replacement() {
+    use ai_crew_sync::auth::{AuthCtx, hash_token};
+    use ai_crew_sync::store::sessions;
+
+    let h = require_db!("t_stale_revoke");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let (agent_id, token_id): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT a.id, t.id FROM api_tokens t JOIN agents a ON a.id = t.agent_id WHERE t.token_hash = $1",
+    )
+    .bind(hash_token(&token))
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let team = team_id(&h.pool, "acme").await;
+    let agent = connect(&h.base, &token).await;
+    let first = call(&agent, "register_session", json!({"session": "window"})).await;
+    let sibling = call(&agent, "register_session", json!({"session": "sibling"})).await;
+    let session_id: Uuid = first["session_id"].as_str().unwrap().parse().unwrap();
+    // The context middleware built at epoch 1, kept while the window rotates.
+    let stale = AuthCtx {
+        agent_id,
+        agent_name: "joaquin".into(),
+        team_id: team,
+        team_slug: "acme".into(),
+        session: "window".into(),
+        session_id: Some(session_id),
+        session_epoch: Some(1),
+        token_id: None,
+    };
+    let old = connect(&h.base, first["session_token"].as_str().unwrap()).await;
+    let resumed = call(&old, "resume_session", json!({})).await;
+    assert_eq!(resumed["epoch"], 2, "{resumed}");
+    let current = resumed["session_token"].as_str().unwrap().to_owned();
+
+    // The stale request runs now: refused, and the replacement still works.
+    let err = match sessions::revoke(&h.pool, &stale, None).await {
+        Ok(label) => panic!("a stale request revoked '{label}'"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("stale"), "{err}");
+    assert_eq!(
+        mcp_status(&h.base, &current).await,
+        200,
+        "the replacement is untouched"
+    );
+    let err = match sessions::revoke(&h.pool, &stale, Some("sibling")).await {
+        Ok(label) => panic!("a stale request revoked the sibling '{label}'"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("stale"), "{err}");
+    assert_eq!(
+        mcp_status(&h.base, sibling["session_token"].as_str().unwrap()).await,
+        200,
+        "the sibling is untouched"
+    );
+
+    // The live credential revokes itself; the agent token closes the
+    // sibling; the labels register again afterwards.
+    let live = connect(&h.base, &current).await;
+    call(&live, "revoke_session", json!({})).await;
+    assert_eq!(mcp_status(&h.base, &current).await, 401);
+    call(&agent, "revoke_session", json!({"session": "sibling"})).await;
+    assert_eq!(
+        mcp_status(&h.base, sibling["session_token"].as_str().unwrap()).await,
+        401
+    );
+    let again = call(&agent, "register_session", json!({"session": "window"})).await;
+    assert!(again["session_token"].is_string(), "{again}");
+    let _ = token_id;
+
+    for c in [agent, old, live] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// An unconfirmed reference handed out again after the window resumed is
+/// handed to the window as it is now, at its current epoch: kept at the
+/// epoch of the first hand-out, the delivery could never be confirmed
+/// again, because confirmation is fenced on the epoch the row carries
+/// (#147). The replaced process still cannot confirm it.
+#[tokio::test]
+async fn audit_postgres_redelivery_after_resume_can_be_confirmed() {
+    let h = require_db!("t_redelivery_epoch");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    enable_conversations(&h.pool, "acme").await;
+    let alice = connect_with_session(&h.base, &alice_token, "lead").await;
+    let bob_agent = connect(&h.base, &bob_token).await;
+    let first = call(&bob_agent, "register_session", json!({"session": "reader"})).await;
+    let bob1 = connect(&h.base, first["session_token"].as_str().unwrap()).await;
+
+    let convo = call(
+        &alice,
+        "create_conversation",
+        json!({"title": "redelivery", "private": true, "invite": ["bob/reader"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&bob1, "join_conversation", json!({"conversation_id": cid})).await;
+    let mid = call(
+        &alice,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "hold this", "request_id": request_id()}),
+    )
+    .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Fetched at epoch 1 and left unconfirmed.
+    let batch = call(&bob1, "fetch_conversation_inbox", json!({})).await;
+    let delivery = batch["references"][0]["delivery_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(batch["references"][0]["message_id"], mid, "{batch}");
+
+    // The window resumes: new secret, epoch 2. The grace period elapses.
+    let resumed = call(&bob1, "resume_session", json!({})).await;
+    assert_eq!(resumed["epoch"], 2, "{resumed}");
+    let bob2 = connect(&h.base, resumed["session_token"].as_str().unwrap()).await;
+    sqlx::query(
+        "UPDATE inbox_deliveries SET handed_at = now() - interval '6 minutes' WHERE id = $1",
+    )
+    .bind(delivery.parse::<Uuid>().unwrap())
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    // Redelivered to the current window, and confirmable by it.
+    let again = call(&bob2, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(
+        again["references"][0]["delivery_id"], delivery,
+        "the same delivery: {again}"
+    );
+    let (epoch,): (Option<i64>,) =
+        sqlx::query_as("SELECT epoch FROM inbox_deliveries WHERE id = $1")
+            .bind(delivery.parse::<Uuid>().unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(epoch, Some(2), "the row now belongs to epoch 2");
+    let done = call(
+        &bob2,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [delivery]}),
+    )
+    .await;
+    assert_eq!(done["confirmed"], 1, "{done}");
+    let receipts = call(&alice, "get_message_receipts", json!({"message_id": mid})).await;
+    assert!(
+        receipts["receipts"][0]["delivered_at"].is_string(),
+        "{receipts}"
+    );
+
+    // A second message: handed out at epoch 2, and the replaced process
+    // (epoch 1's credential is dead; its context would be stale) cannot
+    // confirm what the live window holds.
+    let mid2 = call(
+        &alice,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "and this", "request_id": request_id()}),
+    )
+    .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let batch = call(&bob2, "fetch_conversation_inbox", json!({})).await;
+    let delivery2 = batch["references"][0]["delivery_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(batch["references"][0]["message_id"], mid2, "{batch}");
+    let status = mcp_status(&h.base, first["session_token"].as_str().unwrap()).await;
+    assert_eq!(
+        status, 401,
+        "the replaced credential is refused before it can confirm"
+    );
+    let done = call(
+        &bob2,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [delivery2]}),
+    )
+    .await;
+    assert_eq!(done["confirmed"], 1, "{done}");
+
+    for c in [alice, bob_agent, bob1, bob2] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// The proxy's inbox fetch always answers with the fetch, never with the
+/// confirmation it sends on the side, and a confirmation replayed after a
+/// lost local record converges: the bus lists what it committed and what it
+/// had already, and the spool settles on both (#150).
+#[tokio::test]
+async fn audit_proxy_inbox_keeps_fetch_schema_after_lost_confirmation() {
+    let h = require_db!("t_proxy_inbox_replay");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    enable_conversations(&h.pool, "acme").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "bob", &bob_token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let bob = spawn_proxy(&dir, &repo, &["--host-session", "conv-inbox"], &[]).await;
+    let status = call(&bob, "session_status", json!({})).await;
+    let address = status["address"].as_str().unwrap().to_owned();
+    let alice = connect_with_session(&h.base, &alice_token, "lead").await;
+    let convo = call(
+        &alice,
+        "create_conversation",
+        json!({"title": "spool", "private": true, "invite": [address]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&bob, "join_conversation", json!({"conversation_id": cid})).await;
+    let send = |body: &'static str| {
+        let alice = &alice;
+        let cid = cid.clone();
+        async move {
+            call(
+                alice,
+                "send_conversation_message",
+                json!({"conversation_id": cid, "body": body, "request_id": request_id()}),
+            )
+            .await["message_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    let first = send("first").await;
+
+    // Fetched through the proxy: the reply is the fetch, and the proxy
+    // confirms behind the scenes and records it in its spool.
+    let batch = call(&bob, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(batch["references"][0]["message_id"], first, "{batch}");
+    let spool = std::fs::read_dir(dir.join("inbox"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .expect("the proxy wrote a spool");
+    let confirmed_line = |path: &std::path::Path| -> Vec<bool> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["confirmed"]
+                    .as_bool()
+                    .unwrap()
+            })
+            .collect()
+    };
+    assert_eq!(
+        confirmed_line(&spool),
+        vec![true],
+        "confirmed after the first fetch"
+    );
+
+    // The crash window: the bus committed the confirmation, the local
+    // rewrite was lost. Replay the fetch.
+    let text = std::fs::read_to_string(&spool)
+        .unwrap()
+        .replace("\"confirmed\":true", "\"confirmed\":false");
+    std::fs::write(&spool, text).unwrap();
+    assert_eq!(confirmed_line(&spool), vec![false]);
+    let again = call(&bob, "fetch_conversation_inbox", json!({})).await;
+    assert!(
+        again.get("references").is_some(),
+        "the fetch keeps its schema: {again}"
+    );
+    assert!(
+        again.get("confirmed").is_none(),
+        "the confirmation reply never leaks: {again}"
+    );
+    assert_eq!(
+        confirmed_line(&spool),
+        vec![true],
+        "the replay converged on already_confirmed"
+    );
+
+    // A pending old entry mixed with a fresh one: both settle in one call.
+    let second = send("second").await;
+    let text = std::fs::read_to_string(&spool)
+        .unwrap()
+        .replace("\"confirmed\":true", "\"confirmed\":false");
+    std::fs::write(&spool, text).unwrap();
+    let batch = call(&bob, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(batch["references"][0]["message_id"], second, "{batch}");
+    assert_eq!(
+        confirmed_line(&spool),
+        vec![true, true],
+        "old and new both settled"
+    );
+
+    // The bus itself lists what it settled, scoped to the caller.
+    let direct = connect_with_session(&h.base, &alice_token, "lead").await;
+    let ids: Vec<String> = std::fs::read_to_string(&spool)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["delivery_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    let foreign = call(
+        &direct,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": ids}),
+    )
+    .await;
+    assert_eq!(foreign["confirmed"], 0, "{foreign}");
+    assert_eq!(
+        foreign["already_confirmed"],
+        json!([]),
+        "somebody else's settled ids are not the caller's: {foreign}"
+    );
+
+    let _ = bob.cancel().await;
+    for c in [alice, direct] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// An inbox fetch that was admitted holds the session row for the whole
+/// hand-out: a resume waits for it, and once the resume has committed a
+/// fetch still carrying the old epoch is refused inside its own transaction
+/// rather than stamping the old epoch over the live window's delivery.
+#[tokio::test]
+async fn audit_an_admitted_fetch_cannot_move_a_delivery_backwards() {
+    use ai_crew_sync::store::{inbox, routing::Backends, sessions};
+    let h = require_db!("t_fetch_epoch_fence");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    enable_conversations(&h.pool, "acme").await;
+    let alice = connect_with_session(&h.base, &alice_token, "lead").await;
+    let bob_agent = connect(&h.base, &bob_token).await;
+    let first = call(&bob_agent, "register_session", json!({"session": "reader"})).await;
+    let bob1 = connect(&h.base, first["session_token"].as_str().unwrap()).await;
+    let convo = call(
+        &alice,
+        "create_conversation",
+        json!({"title": "fence", "private": true, "invite": ["bob/reader"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&bob1, "join_conversation", json!({"conversation_id": cid})).await;
+    let mid = call(
+        &alice,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "hold this", "request_id": request_id()}),
+    )
+    .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let bob_epoch1 = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'bob'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "bob".into(),
+        team_id: team_id(&h.pool, "acme").await,
+        team_slug: "acme".into(),
+        session: "reader".into(),
+        session_id: Some(
+            first["session_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        ),
+        session_epoch: Some(1),
+        token_id: None,
+    };
+
+    // An admitted fetch, paused before its hand-out: the guard it passed
+    // holds the session row, so the resume cannot commit underneath it.
+    let mut admitted = h.pool.begin().await.unwrap();
+    sessions::guard(&mut admitted, &bob_epoch1).await.unwrap();
+    let resume = {
+        let bob1 = connect(&h.base, first["session_token"].as_str().unwrap()).await;
+        tokio::spawn(async move {
+            let out = call(&bob1, "resume_session", json!({})).await;
+            let _ = bob1.cancel().await;
+            out
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    assert!(
+        !resume.is_finished(),
+        "the resume must wait for the admitted fetch to finish"
+    );
+    admitted.rollback().await.unwrap();
+    let resumed = tokio::time::timeout(std::time::Duration::from_secs(10), resume)
+        .await
+        .expect("the resume proceeds once the fetch is done")
+        .unwrap();
+    assert_eq!(resumed["epoch"], 2, "{resumed}");
+    let bob2 = connect(&h.base, resumed["session_token"].as_str().unwrap()).await;
+
+    // The live window takes the delivery at epoch 2.
+    let batch = call(&bob2, "fetch_conversation_inbox", json!({})).await;
+    let delivery = batch["references"][0]["delivery_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(batch["references"][0]["message_id"], mid, "{batch}");
+
+    // A fetch still carrying epoch 1, admitted at the door and reaching the
+    // store after the resume: refused inside its transaction, and the row
+    // keeps epoch 2 for the window that holds it.
+    let backends = Backends::postgres_only(h.pool.clone());
+    let err = match inbox::fetch(&h.pool, &backends, &bob_epoch1, None).await {
+        Ok(_) => panic!("a stale fetch must not hand anything out"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("stale"), "{err}");
+    let (epoch,): (Option<i64>,) =
+        sqlx::query_as("SELECT epoch FROM inbox_deliveries WHERE id = $1")
+            .bind(delivery.parse::<Uuid>().unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(epoch, Some(2), "the delivery stays with the live window");
+
+    // The statement itself refuses to go backwards, guard or no guard: a
+    // hand-out at epoch 1 run straight against the store leaves the row at
+    // epoch 2 and hands nothing out.
+    let membership_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM conversation_memberships WHERE conversation_id = $1 AND agent_id = $2",
+    )
+    .bind(cid.parse::<Uuid>().unwrap())
+    .bind(bob_epoch1.agent_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let key = inbox::recipient_key(bob_epoch1.agent_id, "reader");
+    let mut unguarded = h.pool.begin().await.unwrap();
+    let handed = inbox::hand_out_message(
+        &mut unguarded,
+        &bob_epoch1,
+        &key,
+        mid.parse::<Uuid>().unwrap(),
+        membership_id,
+        cid.parse::<Uuid>().unwrap(),
+    )
+    .await
+    .unwrap();
+    unguarded.commit().await.unwrap();
+    assert!(
+        handed.is_none(),
+        "an older epoch must not take the delivery over"
+    );
+    let (epoch,): (Option<i64>,) =
+        sqlx::query_as("SELECT epoch FROM inbox_deliveries WHERE id = $1")
+            .bind(delivery.parse::<Uuid>().unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(epoch, Some(2), "still the live window's");
+    let done = call(
+        &bob2,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [delivery]}),
+    )
+    .await;
+    assert_eq!(done["confirmed"], 1, "{done}");
+
+    for c in [alice, bob_agent, bob1, bob2] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// A proxy renews its session credential before it expires, busy or idle,
+/// without rotating secret or epoch, and records the new expiry in its
+/// binding; a revoked credential is refused at renewal and reported, never
+/// replaced by another identity (#153).
+#[tokio::test]
+async fn audit_proxy_renews_its_credential_before_expiry() {
+    let h = require_db!("t_proxy_renewal");
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "bob", &bob_token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    // A 60 s credential renewed 50 s before it expires: the first renewal is
+    // due 10 s in, and retries are 12 s apart.
+    let knobs = [
+        ("BUS_SESSION_TTL_SECS", "60"),
+        ("BUS_SESSION_RENEW_LEAD_SECS", "50"),
+    ];
+    let busy = spawn_proxy(&dir, &repo, &["--host-session", "conv-busy"], &knobs).await;
+    let idle = spawn_proxy(&dir, &repo, &["--host-session", "conv-idle"], &knobs).await;
+    let started = std::time::Instant::now();
+    let session_of = |status: Value| status["session"].as_str().unwrap().to_owned();
+    let busy_label = session_of(call(&busy, "session_status", json!({})).await);
+    let idle_label = session_of(call(&idle, "session_status", json!({})).await);
+    let row = |label: String| {
+        let pool = h.pool.clone();
+        async move {
+            sqlx::query_as::<_, (i64, Vec<u8>, chrono::DateTime<chrono::Utc>)>(
+                "SELECT epoch, token_hash, expires_at FROM agent_sessions WHERE label = $1 AND revoked_at IS NULL",
+            )
+            .bind(label)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let (busy_epoch, busy_hash, busy_expiry) = row(busy_label.clone()).await;
+    let (idle_epoch, idle_hash, idle_expiry) = row(idle_label.clone()).await;
+    assert!(
+        (busy_expiry - chrono::Utc::now()).num_seconds() <= 60,
+        "the proxy asked for the short lifetime: {busy_expiry}"
+    );
+
+    // Busy: keeps calling. Idle: nothing but its keepalive. Both must be
+    // renewed by the time the first deadline plus a retry has passed.
+    let deadline = started + std::time::Duration::from_secs(40);
+    loop {
+        let me = call(&busy, "whoami", json!({})).await;
+        assert_eq!(me["agent"], "bob", "{me}");
+        let (_, _, b) = row(busy_label.clone()).await;
+        let (_, _, i) = row(idle_label.clone()).await;
+        if b > busy_expiry && i > idle_expiry {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no renewal within 40 s: busy {b} (was {busy_expiry}), idle {i} (was {idle_expiry})"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    let (epoch, hash, expiry) = row(busy_label.clone()).await;
+    assert_eq!(
+        (epoch, &hash),
+        (busy_epoch, &busy_hash),
+        "renewal rotates nothing"
+    );
+    assert!(expiry > busy_expiry);
+    let (epoch, hash, expiry) = row(idle_label.clone()).await;
+    assert_eq!(
+        (epoch, &hash),
+        (idle_epoch, &idle_hash),
+        "renewal rotates nothing"
+    );
+    assert!(expiry > idle_expiry);
+    // The binding carries the renewed expiry, so a hook of this window
+    // reads the same lifetime the bus holds.
+    let binding = std::fs::read_to_string(ai_crew_sync::context::binding_path(&dir, "conv-idle"))
+        .expect("the idle window has a binding");
+    let recorded = serde_json::from_str::<Value>(&binding).unwrap()["expires_at"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let recorded = chrono::DateTime::parse_from_rfc3339(&recorded)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert!(
+        recorded > idle_expiry,
+        "binding stamped: {recorded} vs {idle_expiry}"
+    );
+    let status = call(&idle, "session_status", json!({})).await;
+    assert!(status["error"].is_null(), "{status}");
+
+    // Revocation wins: the parent revokes the idle window by label; its
+    // next renewal is refused and the proxy says so instead of switching
+    // identities.
+    let parent = connect(&h.base, &bob_token).await;
+    call(&parent, "revoke_session", json!({"session": idle_label})).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    loop {
+        let status = call(&idle, "session_status", json!({})).await;
+        if status["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("rejected the credential"))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the refusal was never reported: {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let (_, _, still) = row(busy_label).await;
+    assert!(still > busy_expiry, "the other window is unaffected");
+
+    let _ = busy.cancel().await;
+    let _ = idle.cancel().await;
+    let _ = parent.cancel().await;
+    h.shutdown().await;
+}
+
+/// The renewal schedule follows the connected context, not the presence
+/// tick: a credential established after startup (configure_session on a
+/// proxy that started without a profile) is renewed on time, and after a
+/// refusal a context established anew is renewed again.
+#[tokio::test]
+async fn audit_proxy_renewal_follows_a_context_established_later() {
+    let h = require_db!("t_proxy_renewal_late");
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "bob", &bob_token)]);
+    // No .acs.toml and no default profile: the proxy starts disconnected.
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let knobs = [
+        ("BUS_SESSION_TTL_SECS", "60"),
+        ("BUS_SESSION_RENEW_LEAD_SECS", "50"),
+    ];
+    let proxy = spawn_proxy(&dir, &repo, &["--host-session", "conv-late"], &knobs).await;
+    let status = call(&proxy, "session_status", json!({})).await;
+    assert_eq!(status["connected"], false, "{status}");
+    let label = status["session"].as_str().unwrap().to_owned();
+    let row = |label: String| {
+        let pool = h.pool.clone();
+        async move {
+            sqlx::query_as::<_, (i64, chrono::DateTime<chrono::Utc>)>(
+                "SELECT epoch, expires_at FROM agent_sessions WHERE label = $1 AND revoked_at IS NULL",
+            )
+            .bind(label)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let renewed_after = |label: String, since: chrono::DateTime<chrono::Utc>| {
+        let row = &row;
+        async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+            loop {
+                let (_, expiry) = row(label.clone()).await;
+                if expiry > since {
+                    return expiry;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no renewal within 40 s of {since}"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    };
+
+    // Configured after startup: the keepalive must pick the credential up
+    // now, not on its next five-minute presence tick.
+    let switched = call(&proxy, "configure_session", json!({"profile": "acme"})).await;
+    assert_eq!(switched["status"]["connected"], true, "{switched}");
+    let (_, first_expiry) = row(label.clone()).await;
+    renewed_after(label.clone(), first_expiry).await;
+
+    // Refused, then established anew: the refusal's backoff belongs to the
+    // old context, and the new credential is scheduled at once.
+    let parent = connect(&h.base, &bob_token).await;
+    call(&parent, "revoke_session", json!({"session": label})).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    loop {
+        let status = call(&proxy, "session_status", json!({})).await;
+        if status["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("rejected the credential"))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the refusal was never reported: {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let again = call(&proxy, "configure_session", json!({"profile": "acme"})).await;
+    assert_eq!(again["status"]["connected"], true, "{again}");
+    assert!(again["status"]["error"].is_null(), "{again}");
+    let (_, second_expiry) = row(label.clone()).await;
+    renewed_after(label.clone(), second_expiry).await;
+
+    let _ = proxy.cancel().await;
+    let _ = parent.cancel().await;
+    h.shutdown().await;
+}
+
+/// Every writer of a binding record takes the configuration lock: a proxy
+/// starting while another holder has it waits to publish its record rather
+/// than replacing it underneath a renewal's ownership check.
+#[tokio::test]
+async fn audit_binding_writers_share_the_config_lock() {
+    let h = require_db!("t_binding_lock");
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "bob", &bob_token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+
+    // Hold the directory's lock for three seconds, as a sibling writer would.
+    let lock_path = dir.join(".lock");
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    let holder = tokio::task::spawn_blocking(move || {
+        held.lock().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        held.unlock().unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // The proxy registers its session and then publishes its binding, which
+    // waits for the lock: it cannot answer before the holder lets go.
+    let started = std::time::Instant::now();
+    let proxy = spawn_proxy(&dir, &repo, &["--host-session", "conv-locked"], &[]).await;
+    let status = call(&proxy, "session_status", json!({})).await;
+    let waited = started.elapsed();
+    assert_eq!(status["connected"], true, "{status}");
+    assert!(
+        waited >= std::time::Duration::from_secs(2),
+        "the proxy published its binding without waiting for the lock ({waited:?})"
+    );
+    holder.await.unwrap();
+    let binding = std::fs::read_to_string(ai_crew_sync::context::binding_path(&dir, "conv-locked"))
+        .expect("the binding was written once the lock was free");
+    assert!(
+        binding.contains(status["session"].as_str().unwrap()),
+        "{binding}"
+    );
+
+    let _ = proxy.cancel().await;
+    h.shutdown().await;
+}
+
+/// The Stop drain of a bound window reads that window's inbox whatever the
+/// environment exports: with a parent BUS_TOKEN and a conflicting
+/// BUS_SESSION, with the conflicting session alone, and after a same-team
+/// profile switch. A conversation with no binding keeps the legacy path,
+/// which is what proves the environment really pointed elsewhere (#152).
+#[tokio::test]
+async fn audit_stop_drain_reads_the_bound_window_whatever_the_environment_says() {
+    let h = require_db!("t_stop_drain_binding");
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    let bobby_token = seed_agent(&h.pool, "acme", "bobby").await;
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let dir = proxy_config_dir(
+        h.base.as_str(),
+        &[
+            ("acme", "acme", "bob", &bob_token),
+            ("acme-bobby", "acme", "bobby", &bobby_token),
+        ],
+    );
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let window = spawn_proxy(&dir, &repo, &["--host-session", "audit-hook-window"], &[]).await;
+    let label = call(&window, "session_status", json!({})).await["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The other window really exists: bob's legacy label has announced itself.
+    let legacy = connect_with_session(&h.base, &bob_token, "legacy-other").await;
+    call(&legacy, "heartbeat", json!({"status": "active"})).await;
+    let alice = connect_with_session(&h.base, &alice_token, "lead").await;
+    let ask = |to: String, body: &'static str| {
+        let alice = &alice;
+        async move {
+            call(
+                alice,
+                "post_message",
+                json!({"to": to, "body": body, "metadata": {"question": true}}),
+            )
+            .await
+        }
+    };
+    ask(
+        "bob/legacy-other".to_owned(),
+        "ONLY THE OTHER WINDOW SHOULD SEE THIS QUESTION",
+    )
+    .await;
+
+    let mcp_url = format!("{}/mcp", h.base);
+    let conflicting = [
+        ("BUS_URL", mcp_url.as_str()),
+        ("BUS_TOKEN", bob_token.as_str()),
+        ("BUS_SESSION", "legacy-other"),
+    ];
+    let bound = r#"{"session_id":"audit-hook-window"}"#;
+
+    // Bound window, parent token and conflicting session exported: nothing
+    // to block on, because the other window's question is not this one's.
+    let out = run_hook_env("stop-drain.sh", &dir, &repo, bound, &[], &conflicting).await;
+    assert_eq!(
+        out.trim(),
+        "",
+        "the bound drain injected the other window's question: {out}"
+    );
+    // The same without a token: the binding, not BUS_SESSION, still decides.
+    let out = run_hook_env("stop-drain.sh", &dir, &repo, bound, &[], &conflicting[2..]).await;
+    assert_eq!(out.trim(), "", "{out}");
+    // Positive control: with no binding at all (no session_id in the
+    // payload) the legacy path reads exactly what the environment says.
+    let out = run_hook_env("stop-drain.sh", &dir, &repo, "{}", &[], &conflicting).await;
+    assert!(
+        out.contains("ONLY THE OTHER WINDOW"),
+        "the legacy path did not see the other window's question: {out}"
+    );
+
+    // A question for the bound window is raised, with the token exported
+    // and without it.
+    ask(
+        format!("bob/{label}"),
+        "FOR THE BOUND WINDOW, WITH A TOKEN EXPORTED",
+    )
+    .await;
+    let out = run_hook_env("stop-drain.sh", &dir, &repo, bound, &[], &conflicting).await;
+    assert!(
+        out.contains("\"decision\": \"block\"") || out.contains("\"decision\":\"block\""),
+        "{out}"
+    );
+    assert!(
+        out.contains("WITH A TOKEN EXPORTED") && !out.contains("ONLY THE OTHER WINDOW"),
+        "{out}"
+    );
+    ask(format!("bob/{label}"), "FOR THE BOUND WINDOW, NO TOKEN").await;
+    let out = run_hook_env("stop-drain.sh", &dir, &repo, bound, &[], &conflicting[2..]).await;
+    assert!(
+        out.contains("NO TOKEN") && !out.contains("ONLY THE OTHER WINDOW"),
+        "{out}"
+    );
+
+    // Same-team profile switch: the window is now bobby's, and the drain
+    // follows the binding to bobby's inbox, with bob's token still exported.
+    let switched = call(
+        &window,
+        "configure_session",
+        json!({"profile": "acme-bobby"}),
+    )
+    .await;
+    assert_eq!(switched["status"]["agent"], "bobby", "{switched}");
+    ask(format!("bobby/{label}"), "FOR BOBBY AFTER THE SWITCH").await;
+    ask(
+        format!("bob/{label}"),
+        "FOR BOB, WHO NO LONGER HAS THIS WINDOW",
+    )
+    .await;
+    let out = run_hook_env("stop-drain.sh", &dir, &repo, bound, &[], &conflicting).await;
+    assert!(out.contains("FOR BOBBY AFTER THE SWITCH"), "{out}");
+    assert!(
+        !out.contains("NO LONGER HAS THIS WINDOW") && !out.contains("ONLY THE OTHER WINDOW"),
+        "{out}"
+    );
+
+    // The call event cannot be turned against the window it serves: a
+    // hook asking to resume the session is refused before the bus is
+    // contacted, prints no secret, and the proxy stays authenticated at
+    // its epoch.
+    let (epoch_before,): (i64,) = sqlx::query_as(
+        "SELECT epoch FROM agent_sessions WHERE label = $1 AND revoked_at IS NULL
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&label)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_ai-crew-sync").to_owned();
+    let cfg = dir.clone();
+    let attempt = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(bin)
+            .args([
+                "context",
+                "hook",
+                "--binding",
+                "audit-hook-window",
+                "--event",
+                "call",
+                "--tool",
+                "resume_session",
+                "--args",
+                "{}",
+            ])
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("BUS_CONFIG_DIR", cfg)
+            .output()
+            .expect("the binary runs")
+    })
+    .await
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&attempt.stdout);
+    let stderr = String::from_utf8_lossy(&attempt.stderr);
+    assert_eq!(stdout.trim(), "", "a refused call prints nothing: {stdout}");
+    assert!(stderr.contains("not a hook operation"), "{stderr}");
+    assert!(
+        !stdout.contains("acss_") && !stderr.contains("acss_"),
+        "no secret in any output"
+    );
+    let (epoch_after,): (i64,) = sqlx::query_as(
+        "SELECT epoch FROM agent_sessions WHERE label = $1 AND revoked_at IS NULL
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&label)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(epoch_after, epoch_before, "the window's epoch is untouched");
+    let me = call(&window, "whoami", json!({})).await;
+    assert_eq!(
+        me["agent"], "bobby",
+        "the proxy is still authenticated: {me}"
+    );
+    let status = call(&window, "session_status", json!({})).await;
+    assert!(status["error"].is_null(), "{status}");
+
+    let _ = window.cancel().await;
+    for c in [legacy, alice] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// The listing's race guard, exercised for real: a revocation that commits
+/// between candidate selection and the per-conversation read leaves the
+/// project thread out and the private thread in, with no error (#167).
+#[tokio::test]
+async fn audit_listing_skips_a_grant_revoked_after_candidate_selection() {
+    use ai_crew_sync::store::conversations as convo_store;
+    let h = require_db!("t_listing_race");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    enable_conversations(&h.pool, "acme").await;
+    let alice = connect_with_session(&h.base, &alice_token, "lead").await;
+    let bob_agent = connect(&h.base, &bob_token).await;
+    let cred = call(&bob_agent, "register_session", json!({"session": "reader"})).await;
+    let bob = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    call(&alice, "create_project", json!({"project": "audit"})).await;
+    call(
+        &alice,
+        "grant_project_access",
+        json!({"project": "audit", "agent": "bob"}),
+    )
+    .await;
+    let project_thread = call(
+        &alice,
+        "create_conversation",
+        json!({"title": "project", "project": "audit", "invite": ["bob/reader"]}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let private_thread = call(
+        &alice,
+        "create_conversation",
+        json!({"title": "private", "private": true, "invite": ["bob/reader"]}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    for id in [project_thread, private_thread] {
+        call(&bob, "join_conversation", json!({"conversation_id": id})).await;
+    }
+    let bob_ctx = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'bob'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "bob".into(),
+        team_id: team_id(&h.pool, "acme").await,
+        team_slug: "acme".into(),
+        session: "reader".into(),
+        session_id: Some(
+            cred["session_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        ),
+        session_epoch: Some(1),
+        token_id: None,
+    };
+
+    // Candidates chosen while the grant stands: both threads.
+    let candidates = convo_store::list_candidates(&h.pool, &bob_ctx, false)
+        .await
+        .unwrap();
+    assert!(candidates.contains(&project_thread), "{candidates:?}");
+    assert!(candidates.contains(&private_thread), "{candidates:?}");
+
+    // The revocation commits in the window between the two halves.
+    call(
+        &alice,
+        "grant_project_access",
+        json!({"project": "audit", "agent": "bob", "grant": false}),
+    )
+    .await;
+
+    // The second half copes: the project thread is skipped, the private
+    // one is listed, and nothing errors.
+    let listed = convo_store::list_conversations_among(&h.pool, &bob_ctx, candidates)
+        .await
+        .expect("a revoked candidate must not fail the listing");
+    let ids: Vec<String> = listed.iter().map(|c| c.id.clone()).collect();
+    assert!(ids.contains(&private_thread.to_string()), "{ids:?}");
+    assert!(!ids.contains(&project_thread.to_string()), "{ids:?}");
+
+    // The tool agrees once the candidate query itself runs after the revoke.
+    let through_api = call(&bob, "list_conversations", json!({})).await;
+    let api_ids: Vec<&str> = through_api["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    assert_eq!(
+        api_ids,
+        vec![private_thread.to_string().as_str()],
+        "{through_api}"
+    );
+
+    for c in [alice, bob_agent, bob] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// A receipt event handed out from the bus's own records is rehanded at the
+/// fetching window's epoch after a resume, exactly as a message reference
+/// is, the live window confirms it, and a context still at the old epoch
+/// cannot (#167). The Postgres reconciliation also tops up a batch while
+/// the broker is healthy; here the team's streams are deleted, so the
+/// reference can only have come from Postgres.
+#[tokio::test]
+async fn audit_receipt_event_redelivery_after_resume_on_the_postgres_path() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::{inbox, outbox};
+    let h = require_db_broker!("t_receipt_redelivery");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    JetStreamBackend::provision_inbox(&config, team)
+        .await
+        .unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+    let publish = || async {
+        assert_eq!(
+            outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+            Some(outbox::Settled::Stored)
+        );
+        inbox::publish_pending(&h.pool, &backend, team, 100)
+            .await
+            .unwrap()
+    };
+    // Both sides are registered windows: the sender's inbox is where the
+    // receipt event lands, and only a window has an inbox.
+    let alice_agent = connect(&h.base, &alice_token).await;
+    let alice_cred = call(&alice_agent, "register_session", json!({"session": "lead"})).await;
+    let alice1 = connect(&h.base, alice_cred["session_token"].as_str().unwrap()).await;
+    let bob_agent = connect(&h.base, &bob_token).await;
+    let bob_cred = call(&bob_agent, "register_session", json!({"session": "reader"})).await;
+    let bob = connect(&h.base, bob_cred["session_token"].as_str().unwrap()).await;
+
+    let cid = call(
+        &alice1,
+        "create_conversation",
+        json!({"title": "receipts", "private": true, "invite": ["bob/reader"]}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call(&bob, "join_conversation", json!({"conversation_id": cid})).await;
+    let mid = call(
+        &alice1,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "look again", "request_id": request_id()}),
+    )
+    .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(publish().await, 1, "one reference for Bob");
+    let batch = call(&bob, "fetch_conversation_inbox", json!({})).await;
+    let bob_delivery = batch["references"][0]["delivery_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call(
+        &bob,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [bob_delivery]}),
+    )
+    .await;
+    // The acknowledgement queues Alice's receipt event; publishing it marks
+    // it `published`, which is what the Postgres hand-out reconciles from.
+    call(
+        &bob,
+        "ack_message",
+        json!({"conversation_id": cid, "message_id": mid, "resolved": false}),
+    )
+    .await;
+    assert_eq!(
+        inbox::publish_pending(&h.pool, &backend, team, 100)
+            .await
+            .unwrap(),
+        1,
+        "Alice's receipt event is published"
+    );
+
+    // The team's streams are deleted (not a broker outage: the resources
+    // are gone), so the broker read fails and what Alice is owed can only
+    // come from the bus's records.
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    let batch = call(&alice1, "fetch_conversation_inbox", json!({})).await;
+    let refs = batch["references"].as_array().unwrap();
+    assert_eq!(refs.len(), 1, "{batch}");
+    assert_eq!(refs[0]["kind"], "receipt", "{batch}");
+    assert_eq!(refs[0]["source"], "bus", "{batch}");
+    assert_eq!(refs[0]["message_id"], mid, "{batch}");
+    assert_eq!(batch["from_broker"], 0, "{batch}");
+    assert!(
+        batch["note"]
+            .as_str()
+            .is_some_and(|n| n.contains("could not be read")),
+        "the fetch says the broker was not the source: {batch}"
+    );
+    let delivery = refs[0]["delivery_id"].as_str().unwrap().to_owned();
+
+    // Fetched at epoch 1 and left unconfirmed; the window resumes and the
+    // hand-out grace elapses.
+    let resumed = call(&alice1, "resume_session", json!({})).await;
+    assert_eq!(resumed["epoch"], 2, "{resumed}");
+    let alice2 = connect(&h.base, resumed["session_token"].as_str().unwrap()).await;
+    sqlx::query(
+        "UPDATE inbox_deliveries SET handed_at = now() - interval '6 minutes' WHERE id = $1",
+    )
+    .bind(delivery.parse::<Uuid>().unwrap())
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    // Rehanded to the live window at its epoch, and confirmable by it.
+    let again = call(&alice2, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(
+        again["references"][0]["delivery_id"], delivery,
+        "the same delivery: {again}"
+    );
+    assert_eq!(again["references"][0]["kind"], "receipt", "{again}");
+    let (epoch,): (Option<i64>,) =
+        sqlx::query_as("SELECT epoch FROM inbox_deliveries WHERE id = $1")
+            .bind(delivery.parse::<Uuid>().unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(epoch, Some(2), "the row now belongs to epoch 2");
+
+    // A context still at epoch 1 cannot confirm what the live window holds:
+    // the store refuses it as stale before touching the row.
+    let stale = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'alice'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "alice".into(),
+        team_id: team,
+        team_slug: "acme".into(),
+        session: "lead".into(),
+        session_id: Some(
+            alice_cred["session_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        ),
+        session_epoch: Some(1),
+        token_id: None,
+    };
+    let backends =
+        ai_crew_sync::store::routing::Backends::with_jetstream(h.pool.clone(), config.clone());
+    let err =
+        match inbox::confirm(&h.pool, &backends, &stale, std::slice::from_ref(&delivery)).await {
+            Ok(_) => panic!("a stale context must not confirm the live window's delivery"),
+            Err(e) => e.to_string(),
+        };
+    assert!(err.contains("stale"), "{err}");
+    let (still,): (Option<chrono::DateTime<chrono::Utc>>,) =
+        sqlx::query_as("SELECT confirmed_at FROM inbox_deliveries WHERE id = $1")
+            .bind(delivery.parse::<Uuid>().unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(
+        still.is_none(),
+        "nothing was confirmed by the stale context"
+    );
+
+    let done = call(
+        &alice2,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [delivery]}),
+    )
+    .await;
+    assert_eq!(done["confirmed"], 1, "{done}");
+
+    for c in [alice_agent, alice1, alice2, bob_agent, bob] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// The body sweep must not drop the only readable copy of a body while its
+/// backend cannot confirm it still holds it. Postgres is the last copy
+/// during a broker outage and after the broker lost its stream; releasing
+/// it there turns a recoverable outage into an unreadable thread, and a
+/// lost stream into permanent loss. A healthy broker still releases, and
+/// releasing resumes by itself once the broker is back (#170).
+#[tokio::test]
+async fn the_sweep_keeps_a_body_its_backend_cannot_confirm() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::outbox;
+    use ai_crew_sync::store::routing::Backends;
+
+    let h = require_db_broker!("t_sweep_guard");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let dani = connect_with_session(&h.base, &dani_token, "review").await;
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+    let healthy = Backends::with_jetstream(h.pool.clone(), config.clone());
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "on the broker", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    let cuuid: Uuid = cid.parse().unwrap();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+    let send = |body: &'static str| {
+        let owner = &owner;
+        let cid = cid.clone();
+        async move {
+            call(
+                owner,
+                "send_conversation_message",
+                json!({"conversation_id": cid, "body": body, "request_id": request_id()}),
+            )
+            .await["message_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    let local_body = |mid: String| {
+        let pool = h.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT body FROM conversation_messages WHERE id = $1")
+                .bind(mid.parse::<Uuid>().unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+
+    // 1. The broker is unreachable (a process that is down): nothing is
+    //    released, whatever the flags say.
+    let first = send("keep me").await;
+    assert_eq!(
+        outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+        Some(outbox::Settled::Stored)
+    );
+    let unreachable = Backends::with_jetstream(
+        h.pool.clone(),
+        Config::new("nats://127.0.0.1:1").with_limits(1_000, 16 * 1024 * 1024),
+    );
+    assert_eq!(
+        outbox::release_published_bodies(&h.pool, &unreachable, Some(cuuid), 0)
+            .await
+            .unwrap(),
+        0,
+        "the sweep released a body while the broker was unreachable"
+    );
+    assert_eq!(local_body(first.clone()).await, "keep me");
+
+    // 2. The broker is back: the same body is confirmed and released, with
+    //    no operator action in between, and history reads it by locator.
+    assert_eq!(
+        outbox::release_published_bodies(&h.pool, &healthy, Some(cuuid), 0)
+            .await
+            .unwrap(),
+        1,
+        "a healthy broker still releases"
+    );
+    assert_eq!(local_body(first.clone()).await, "");
+    let page = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(page["messages"][0]["body"], "keep me", "{page}");
+
+    // 3. The broker loses the stream BEFORE the sweep runs on a second
+    //    body. Postgres still holds it: that copy is now the only one there
+    //    is, and the sweep leaves it alone.
+    let second = send("and me").await;
+    assert_eq!(
+        outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+        Some(outbox::Settled::Stored)
+    );
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    assert_eq!(
+        outbox::release_published_bodies(&h.pool, &healthy, Some(cuuid), 0)
+            .await
+            .unwrap(),
+        0,
+        "the sweep released a body while its backend could not confirm holding it"
+    );
+    assert_eq!(
+        local_body(second.clone()).await,
+        "and me",
+        "the last readable copy of the body was destroyed by the bus itself"
+    );
+    let page = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(page["messages"][1]["body"], "and me", "{page}");
+    // The body released while healthy and then lost still reads as
+    // unavailable, with its receipts intact: this path is unchanged.
+    assert_eq!(page["messages"][0]["body"], "");
+    assert_eq!(page["messages"][0]["publication"], "stored");
+    assert!(page["messages"][0]["unavailable"].is_string(), "{page}");
+    let receipts = call(&owner, "get_message_receipts", json!({"message_id": first})).await;
+    assert_eq!(receipts["total"], 1, "{receipts}");
+
+    // 4. A stream re-created empty (a restore older than the publication)
+    //    answers, but not with this body: still kept.
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    assert_eq!(
+        outbox::release_published_bodies(&h.pool, &healthy, Some(cuuid), 0)
+            .await
+            .unwrap(),
+        0,
+        "a stream that does not hold the body confirms nothing"
+    );
+    assert_eq!(local_body(second).await, "and me");
+
+    // The fixture broker is shared: give the re-created stream back.
+    let _ = JetStreamBackend::deprovision(&config, team).await;
+    for c in [owner, dani] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// An unreadable body cannot be mistaken for an empty message: the schema
+/// says so (`unavailable` is always present, `null` when the body is real),
+/// the tool descriptions say so, and the reason carries one classification
+/// and none of the broker's internals (#171).
+#[tokio::test]
+async fn an_unreadable_body_is_labelled_for_the_model() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::outbox;
+    use ai_crew_sync::store::routing::Backends;
+
+    let h = require_db_broker!("t_unavailable_label");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let dani = connect_with_session(&h.base, &dani_token, "review").await;
+
+    // What a model reads before its first call already says it.
+    let tools = dani.list_all_tools().await.unwrap();
+    for name in ["read_conversation", "get_conversation_message"] {
+        let tool = tools.iter().find(|t| t.name == name).unwrap();
+        let description = tool.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("`unavailable`"),
+            "{name}: {description}"
+        );
+        assert!(description.contains("placeholder"), "{name}: {description}");
+        assert!(
+            description.contains("never stored") && description.contains("no longer held"),
+            "the permanent cases are named too: {name}: {description}"
+        );
+        assert!(
+            description.contains("Never quote or summarise"),
+            "both tools carry the same instruction: {name}: {description}"
+        );
+    }
+
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+    let cid = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "labelled", "private": true, "invite": ["dani/review"]}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+    let mid = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "real text", "request_id": request_id()}),
+    )
+    .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+        Some(outbox::Settled::Stored)
+    );
+    outbox::release_published_bodies(
+        &h.pool,
+        &Backends::with_jetstream(h.pool.clone(), config.clone()),
+        Some(cid.parse().unwrap()),
+        0,
+    )
+    .await
+    .unwrap();
+
+    // Healthy: the field is there and says null, so its absence is never
+    // something a model has to infer.
+    let page = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    let message = &page["messages"][0];
+    assert_eq!(message["body"], "real text", "{page}");
+    assert!(
+        message.get("unavailable").is_some_and(|v| v.is_null()),
+        "unavailable must be present and null on a healthy read: {page}"
+    );
+    let one = call(
+        &dani,
+        "get_conversation_message",
+        json!({"message_id": mid}),
+    )
+    .await;
+    assert!(one.get("unavailable").is_some_and(|v| v.is_null()), "{one}");
+
+    // The broker loses the stream: the body is a placeholder with a reason
+    // that has exactly one class and none of the broker's codes.
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    for read in [
+        call(&dani, "read_conversation", json!({"conversation_id": cid})).await["messages"][0]
+            .clone(),
+        call(
+            &dani,
+            "get_conversation_message",
+            json!({"message_id": mid}),
+        )
+        .await,
+    ] {
+        assert_eq!(read["body"], "", "{read}");
+        assert_eq!(read["seq"], 1, "{read}");
+        assert_eq!(read["from"], "joaquin", "{read}");
+        assert_eq!(read["publication"], "stored", "{read}");
+        let reason = read["unavailable"].as_str().expect("a reason");
+        assert_eq!(reason.matches("conflict:").count(), 1, "{reason}");
+        assert!(!reason.contains("invalid input"), "{reason}");
+        assert!(!reason.contains("jetstream error"), "{reason}");
+        assert!(!reason.contains("code"), "{reason}");
+        assert!(reason.contains("not lost"), "{reason}");
+    }
+    let receipts = call(&owner, "get_message_receipts", json!({"message_id": mid})).await;
+    assert_eq!(receipts["total"], 1, "{receipts}");
+
+    // A permanent absence reads as one: a tombstoned body says it is no
+    // longer held, not that the backend is away right now.
+    ai_crew_sync::store::outbox::tombstone(&h.pool, mid.parse().unwrap(), "retention")
+        .await
+        .unwrap();
+    let gone = call(
+        &dani,
+        "get_conversation_message",
+        json!({"message_id": mid}),
+    )
+    .await;
+    assert_eq!(gone["publication"], "tombstoned", "{gone}");
+    let reason = gone["unavailable"].as_str().expect("a reason");
+    assert!(reason.contains("no longer held"), "{reason}");
+    assert!(
+        !reason.contains("right now"),
+        "a permanent gap is not retryable: {reason}"
+    );
+
+    for c in [owner, dani] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Small teams fit on a small broker: three teams provisioned with explicit
+/// quotas on the fixture's 512 MiB store, each stream carrying exactly the
+/// limits asked for, and a quota the store cannot reserve refused with the
+/// arithmetic spelled out rather than "insufficient storage resources"
+/// (#169).
+#[tokio::test]
+async fn small_quotas_let_several_teams_share_a_bounded_broker() {
+    use ai_crew_sync::admin::{StreamQuotas, team_stream};
+    use ai_crew_sync::store::jetstream::{self, Config, JetStreamBackend};
+    let h = require_db_broker!("t_stream_quotas");
+    let mib = 1024 * 1024;
+    let small = StreamQuotas {
+        max_bytes: 32 * mib,
+        max_messages: 5_000,
+        inbox_max_bytes: 4 * mib,
+        inbox_max_messages: 2_000,
+    };
+    let context = async_nats::jetstream::new(
+        async_nats::connect(nats_url())
+            .await
+            .expect("the fixture broker"),
+    );
+    let mut ids = Vec::new();
+    for slug in ["small-a", "small-b", "small-c"] {
+        seed_agent(&h.pool, slug, "x").await;
+        team_stream(&h.pool, slug, &nats_url(), None, false, small, false)
+            .await
+            .expect("a small team provisions");
+        let id = team_id(&h.pool, slug).await;
+        ids.push(id);
+        let mut bodies = context
+            .get_stream(jetstream::stream_name(id))
+            .await
+            .unwrap();
+        let info = bodies.info().await.unwrap();
+        assert_eq!(info.config.max_bytes, 32 * mib, "{slug} bodies");
+        assert_eq!(info.config.max_messages, 5_000, "{slug} bodies");
+        let mut inbox = context
+            .get_stream(jetstream::inbox_stream_name(id))
+            .await
+            .unwrap();
+        let info = inbox.info().await.unwrap();
+        assert_eq!(info.config.max_bytes, 4 * mib, "{slug} inbox");
+        assert_eq!(info.config.max_messages, 2_000, "{slug} inbox");
+    }
+
+    // The fixture's store is 512 MiB; 3 × 36 MiB are reserved. Asking for
+    // 480 MiB more is refused by the broker, and the error says why in
+    // terms an operator can act on.
+    seed_agent(&h.pool, "greedy", "x").await;
+    let greedy = StreamQuotas {
+        max_bytes: 480 * mib,
+        ..small
+    };
+    let err = team_stream(&h.pool, "greedy", &nats_url(), None, false, greedy, false)
+        .await
+        .expect_err("the store cannot reserve that much")
+        .to_string();
+    assert!(err.contains("cannot reserve"), "{err}");
+    assert!(err.contains("max_file_store"), "{err}");
+    assert!(err.contains("already reserved"), "{err}");
+    assert!(err.contains("actually used"), "{err}");
+    assert!(err.contains("--max-bytes"), "{err}");
+
+    // Nonsense is refused before the broker is asked.
+    let tiny = StreamQuotas {
+        max_bytes: 1024,
+        ..small
+    };
+    let err = team_stream(&h.pool, "greedy", &nats_url(), None, false, tiny, false)
+        .await
+        .expect_err("a body stream must hold one body")
+        .to_string();
+    assert!(err.contains("--max-bytes must be at least"), "{err}");
+
+    for id in ids {
+        let config = Config::new(nats_url());
+        JetStreamBackend::deprovision(&config, id).await.unwrap();
+    }
+    h.shutdown().await;
+}
+
+/// A routine `team stream` on a team that already has its streams keeps
+/// their limits whatever it is asked for, and says so. Changing them is
+/// explicit, refused below what a stream holds, and never touches bodies
+/// or references (#169).
+#[tokio::test]
+async fn existing_quotas_are_kept_unless_updated_explicitly() {
+    use ai_crew_sync::admin::{StreamQuotas, team_stream};
+    use ai_crew_sync::store::jetstream::{self, Config, JetStreamBackend, StreamKind};
+    use ai_crew_sync::store::{inbox, outbox};
+    let h = require_db_broker!("t_stream_quota_update");
+    let mib = 1024 * 1024;
+    let owner_token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let first = StreamQuotas {
+        max_bytes: 16 * mib,
+        max_messages: 1_000,
+        inbox_max_bytes: 4 * mib,
+        inbox_max_messages: 1_000,
+    };
+    team_stream(&h.pool, "acme", &nats_url(), None, false, first, false)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * mib);
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+
+    // Two bodies on the stream and one reference in the inbox.
+    let owner = connect_with_session(&h.base, &owner_token, "impl").await;
+    let dani_agent = connect(&h.base, &dani_token).await;
+    let cred = call(
+        &dani_agent,
+        "register_session",
+        json!({"session": "review"}),
+    )
+    .await;
+    let dani = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let cid = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "quotas", "private": true, "invite": ["dani/review"]}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+    for body in ["one", "two"] {
+        call(
+            &owner,
+            "send_conversation_message",
+            json!({"conversation_id": cid, "body": body, "request_id": request_id()}),
+        )
+        .await;
+        assert_eq!(
+            outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+            Some(outbox::Settled::Stored)
+        );
+    }
+    assert_eq!(
+        inbox::publish_pending(&h.pool, &backend, team, 100)
+            .await
+            .unwrap(),
+        2
+    );
+    let context = async_nats::jetstream::new(async_nats::connect(nats_url()).await.unwrap());
+    let limits = |name: String| {
+        let context = context.clone();
+        async move {
+            let mut stream = context.get_stream(name).await.unwrap();
+            let info = stream.info().await.unwrap();
+            (
+                info.config.max_messages,
+                info.config.max_bytes,
+                info.state.messages,
+            )
+        }
+    };
+    assert_eq!(
+        limits(jetstream::stream_name(team)).await,
+        (1_000, 16 * mib, 2),
+        "the bodies are on the stream"
+    );
+
+    // A retry with other numbers changes nothing.
+    let other = StreamQuotas {
+        max_bytes: 64 * mib,
+        max_messages: 9_000,
+        inbox_max_bytes: 8 * mib,
+        inbox_max_messages: 9_000,
+    };
+    team_stream(&h.pool, "acme", &nats_url(), None, false, other, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        limits(jetstream::stream_name(team)).await,
+        (1_000, 16 * mib, 2),
+        "kept"
+    );
+    assert_eq!(
+        limits(jetstream::inbox_stream_name(team)).await,
+        (1_000, 4 * mib, 2),
+        "kept"
+    );
+
+    // An explicit update below what the stream holds is refused, with the
+    // count, and nothing changes.
+    let too_small = StreamQuotas {
+        max_messages: 1,
+        ..first
+    };
+    let err = team_stream(&h.pool, "acme", &nats_url(), None, false, too_small, true)
+        .await
+        .expect_err("two bodies do not fit a ceiling of one")
+        .to_string();
+    assert!(err.contains("holds 2 messages"), "{err}");
+    assert!(err.contains("nothing was changed"), "{err}");
+    assert_eq!(
+        limits(jetstream::stream_name(team)).await,
+        (1_000, 16 * mib, 2)
+    );
+    // Three large bodies push the stream past 2 MiB, the smallest quota
+    // the command accepts; a byte ceiling below the contents is refused
+    // just like a count.
+    for _ in 0..3 {
+        call(
+            &owner,
+            "send_conversation_message",
+            json!({"conversation_id": cid, "body": "x".repeat(800 * 1024), "request_id": request_id()}),
+        )
+        .await;
+        assert_eq!(
+            outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+            Some(outbox::Settled::Stored)
+        );
+    }
+    let err = JetStreamBackend::update_quotas(
+        &Config::new(nats_url()).with_limits(10, 2 * mib),
+        team,
+        StreamKind::Bodies,
+    )
+    .await
+    .expect_err("a byte ceiling below the contents is refused too")
+    .to_string();
+    assert!(err.contains("more than the requested ceiling"), "{err}");
+    assert!(err.contains("MiB"), "{err}");
+    assert_eq!(
+        limits(jetstream::stream_name(team)).await,
+        (1_000, 16 * mib, 5)
+    );
+
+    // A change the broker cannot reserve leaves the team as it was: the
+    // fixture's store is 512 MiB, and 480 MiB for the inbox on top of
+    // 64 MiB for bodies does not fit. The fixture's account has no budget
+    // of its own, so the refusal comes from the broker when the inbox is
+    // updated, after the body stream was; the command restores the body
+    // stream and says so. Both keep their limits.
+    let too_much = StreamQuotas {
+        inbox_max_bytes: 480 * mib,
+        ..other
+    };
+    let err = team_stream(&h.pool, "acme", &nats_url(), None, false, too_much, true)
+        .await
+        .expect_err("the store cannot reserve that much")
+        .to_string();
+    assert!(err.contains("nothing was changed"), "{err}");
+    assert!(err.contains("Restored"), "{err}");
+    assert!(err.contains("could not update"), "{err}");
+    assert!(err.contains("already reserved"), "{err}");
+    assert_eq!(
+        limits(jetstream::stream_name(team)).await,
+        (1_000, 16 * mib, 5),
+        "the body stream was not changed on its own"
+    );
+    assert_eq!(
+        limits(jetstream::inbox_stream_name(team)).await,
+        (1_000, 4 * mib, 2)
+    );
+
+    // An explicit update to larger limits applies, and everything stored
+    // is still there.
+    team_stream(&h.pool, "acme", &nats_url(), None, false, other, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        limits(jetstream::stream_name(team)).await,
+        (9_000, 64 * mib, 5),
+        "updated"
+    );
+    assert_eq!(
+        limits(jetstream::inbox_stream_name(team)).await,
+        (9_000, 8 * mib, 2),
+        "updated"
+    );
+    let page = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    let bodies: Vec<&str> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["body"].as_str())
+        .collect();
+    assert_eq!(bodies.len(), 5, "{page}");
+    assert_eq!(&bodies[..2], ["one", "two"], "{page}");
+    let batch = call(&dani, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(batch["from_broker"], 2, "the references survived: {batch}");
+
+    // The fixture broker is shared by every test in the run: give the
+    // reservation back.
+    for c in [owner, dani_agent, dani] {
+        let _ = c.cancel().await;
+    }
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    h.shutdown().await;
+}
+
+/// A body the backend cannot confirm holds up nothing else: the pass steps
+/// over it and releases what comes after, and a team whose stream is gone
+/// does not keep another team's bodies staged. A migration in flight is
+/// left alone entirely (#170).
+#[tokio::test]
+async fn an_unconfirmable_body_does_not_hold_up_the_sweep() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::outbox;
+    use ai_crew_sync::store::routing::Backends;
+
+    let h = require_db_broker!("t_sweep_fairness");
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    let backends = Backends::with_jetstream(h.pool.clone(), config.clone());
+    let local_body = |mid: String| {
+        let pool = h.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT body FROM conversation_messages WHERE id = $1")
+                .bind(mid.parse::<Uuid>().unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+
+    // Two teams, both routed to the broker, each with its own stream.
+    let mut sent = Vec::new();
+    let mut clients = Vec::new();
+    for slug in ["alpha", "beta"] {
+        let token = seed_agent(&h.pool, slug, "joaquin").await;
+        enable_conversations(&h.pool, slug).await;
+        let team = team_id(&h.pool, slug).await;
+        sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+            .bind(team)
+            .execute(&h.pool)
+            .await
+            .unwrap();
+        JetStreamBackend::provision(&config, team).await.unwrap();
+        let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+        let client = connect_with_session(&h.base, &token, "impl").await;
+        let cid = call(
+            &client,
+            "create_conversation",
+            json!({"title": slug, "private": true}),
+        )
+        .await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // Two bodies per team, oldest first.
+        let mut ids = Vec::new();
+        for body in ["first", "second"] {
+            let mid = call(
+                &client,
+                "send_conversation_message",
+                json!({"conversation_id": cid, "body": body, "request_id": request_id()}),
+            )
+            .await["message_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+                Some(outbox::Settled::Stored)
+            );
+            ids.push(mid);
+        }
+        sent.push((slug, team, cid, ids));
+        clients.push(client);
+    }
+
+    // Alpha's oldest body can never be confirmed: the digest recorded for
+    // it does not match what the broker holds. It must not keep alpha's
+    // newer body staged behind it.
+    let (_, alpha_team, _, alpha_ids) = &sent[0];
+    sqlx::query("UPDATE conversation_messages SET body_sha256 = $2 WHERE id = $1")
+        .bind(alpha_ids[0].parse::<Uuid>().unwrap())
+        .bind("0".repeat(64))
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    // And beta's stream is gone entirely: its bodies stay, and that must
+    // not stop alpha's from being released. Beta's messages are backdated
+    // so the broken backend is the one this pass meets FIRST: a sweep that
+    // gave up on the first failure would never reach alpha.
+    let (_, beta_team, _, beta_ids) = &sent[1];
+    for id in beta_ids {
+        sqlx::query(
+            "UPDATE conversation_messages SET created_at = now() - interval '1 day' WHERE id = $1",
+        )
+        .bind(id.parse::<Uuid>().unwrap())
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    }
+    JetStreamBackend::deprovision(&config, *beta_team)
+        .await
+        .unwrap();
+
+    let released = outbox::release_published_bodies(&h.pool, &backends, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(released, 1, "exactly alpha's confirmable body");
+    assert_eq!(
+        local_body(alpha_ids[0].clone()).await,
+        "first",
+        "a body whose digest does not match stays"
+    );
+    assert_eq!(
+        local_body(alpha_ids[1].clone()).await,
+        "",
+        "the body behind it was released in the same pass"
+    );
+    for id in beta_ids {
+        assert!(
+            !local_body(id.clone()).await.is_empty(),
+            "beta's stream is gone; its bodies stay"
+        );
+    }
+
+    // A message a migration is working on is not a candidate at all: the
+    // move writes the body back into the row before its cutover.
+    let (_, _, gamma_cid, gamma_ids) = {
+        let token = seed_agent(&h.pool, "gamma", "joaquin").await;
+        enable_conversations(&h.pool, "gamma").await;
+        let team = team_id(&h.pool, "gamma").await;
+        sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+            .bind(team)
+            .execute(&h.pool)
+            .await
+            .unwrap();
+        JetStreamBackend::provision(&config, team).await.unwrap();
+        let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+        let client = connect_with_session(&h.base, &token, "impl").await;
+        let cid = call(
+            &client,
+            "create_conversation",
+            json!({"title": "moving", "private": true}),
+        )
+        .await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mid = call(
+            &client,
+            "send_conversation_message",
+            json!({"conversation_id": cid, "body": "mid move", "request_id": request_id()}),
+        )
+        .await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+            Some(outbox::Settled::Stored)
+        );
+        clients.push(client);
+        ("gamma", team, cid, vec![mid])
+    };
+    let migration: Uuid = sqlx::query_scalar(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ((SELECT team_id FROM conversations WHERE id = $1), $1, 'to_postgres', 'copying')
+         RETURNING id",
+    )
+    .bind(gamma_cid.parse::<Uuid>().unwrap())
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO conversation_migration_items (migration_id, message_id, checksum, bytes)
+         VALUES ($1, $2, 'x', 8)",
+    )
+    .bind(migration)
+    .bind(gamma_ids[0].parse::<Uuid>().unwrap())
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        outbox::release_published_bodies(&h.pool, &backends, Some(gamma_cid.parse().unwrap()), 0)
+            .await
+            .unwrap(),
+        0,
+        "a body a migration is copying back must not be cleared"
+    );
+    assert_eq!(local_body(gamma_ids[0].clone()).await, "mid move");
+
+    for team in [*alpha_team, *beta_team] {
+        let _ = JetStreamBackend::deprovision(&config, team).await;
+    }
+    let _ = JetStreamBackend::deprovision(&config, team_id(&h.pool, "gamma").await).await;
+    for c in clients {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// A broker that cannot be read is reported to the MODEL in the inbox's
+/// `note`, and that note is LLM-facing text like the `unavailable` reason
+/// #171 cleaned: one class of problem, no broker internals, and nothing that
+/// asks an agent to run an operator command it has no access to (#175).
+#[tokio::test]
+async fn the_inbox_note_carries_no_broker_internals() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::outbox;
+
+    let h = require_db_broker!("t_inbox_note");
+    let owner_token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    JetStreamBackend::provision_inbox(&config, team)
+        .await
+        .unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+
+    let owner = connect_with_session(&h.base, &owner_token, "impl").await;
+    let dani_agent = connect(&h.base, &dani_token).await;
+    let cred = call(
+        &dani_agent,
+        "register_session",
+        json!({"session": "review"}),
+    )
+    .await;
+    let review = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "inbox note", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(
+        &review,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "still owed", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(
+        outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+        Some(outbox::Settled::Stored)
+    );
+
+    // The broker loses the team's streams. The inbox must still answer from
+    // Postgres — that part already works — and say so in a way a model can use.
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+
+    let batch = call(&review, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(
+        batch["references"].as_array().unwrap().len(),
+        1,
+        "the reference is still owed, from Postgres"
+    );
+    let note = batch["note"]
+        .as_str()
+        .expect("a broker failure is explained");
+    assert_clean_broker_note(note);
+
+    for c in [owner, dani_agent, review] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// The other failure branch: the bodies stream is there, so the backend
+/// opens, and reading the team's inbox stream is what fails. Same contract
+/// for the note (#175). Every failure inside `fetch_references` lands here,
+/// and this is the one a test can reach: the durable consumer's name is
+/// derived from hex, so no caller input can make opening or reading it fail.
+#[tokio::test]
+async fn the_inbox_note_is_clean_when_the_inbox_stream_is_gone() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::outbox;
+
+    let h = require_db_broker!("t_inbox_note_consumer");
+    let owner_token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    // Bodies only: `connect` succeeds and reading the inbox is what fails,
+    // which is the state a half-finished provisioning leaves behind. The
+    // operator text it produces names a CLI command, which is exactly what
+    // must not reach the model.
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+
+    let owner = connect_with_session(&h.base, &owner_token, "impl").await;
+    let dani_agent = connect(&h.base, &dani_token).await;
+    let cred = call(
+        &dani_agent,
+        "register_session",
+        json!({"session": "review"}),
+    )
+    .await;
+    let review = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let cid = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "no inbox stream", "private": true, "invite": ["dani/review"]}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call(
+        &review,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "owed as well", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(
+        outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+        Some(outbox::Settled::Stored)
+    );
+
+    let batch = call(&review, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(
+        batch["from_broker"], 0,
+        "the broker supplied nothing: {batch}"
+    );
+    assert_eq!(
+        batch["references"].as_array().unwrap().len(),
+        1,
+        "and the reference still arrives from Postgres: {batch}"
+    );
+    let note = batch["note"]
+        .as_str()
+        .expect("a broker failure is explained");
+    assert_clean_broker_note(note);
+    assert!(
+        !note.contains("inbox:") && !note.contains("consumer"),
+        "no broker vocabulary either: {note}"
+    );
+
+    let _ = JetStreamBackend::deprovision(&config, team).await;
+    for c in [owner, dani_agent, review] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// What an inbox note may say when the broker fails: one class of problem,
+/// what the agent should do, and nothing an operator would need.
+fn assert_clean_broker_note(note: &str) {
+    for internal in [
+        "error code",
+        "code 404",
+        "jetstream error",
+        "10059",
+        "request error",
+        "ACS_T_",
+        "ACS_I_",
+        "credential",
+    ] {
+        assert!(
+            !note.contains(internal),
+            "the inbox note leaks broker internals ({internal:?}): {note}"
+        );
+    }
+    assert!(
+        !note.contains("team stream"),
+        "the inbox note tells an agent to run an operator command: {note}"
+    );
+    assert!(
+        !note.starts_with("invalid input"),
+        "a valid call is not invalid input: {note}"
+    );
+    assert!(
+        note.contains("could not be read") && note.contains("page is complete"),
+        "the note says what happened and that the page is whole: {note}"
+    );
+    assert!(
+        !note.contains("team stream --provision"),
+        "and never an operator command: {note}"
+    );
+}
+
+/// Call a tool and return the raw `ErrorData` it failed with, so a test can
+/// compare codes and messages instead of a rendering of them.
+async fn call_error_data(client: &Client, name: &str, args: Value) -> rmcp::model::ErrorData {
+    let args: serde_json::Map<String, Value> = serde_json::from_value(args).unwrap();
+    match client
+        .call_tool(CallToolRequestParams::new(name.to_string()).with_arguments(args))
+        .await
+    {
+        Err(rmcp::service::ServiceError::McpError(data)) => data,
+        Err(other) => panic!("{name} failed outside MCP: {other}"),
+        Ok(result) => panic!("{name} unexpectedly succeeded: {result:?}"),
+    }
+}
+
+/// An error the bus writes for the model reaches the model through the
+/// proxy exactly as a direct call gets it: same code, same words. The proxy
+/// used to re-code it as an internal error and prefix rmcp's rendering of a
+/// JSON-RPC code ("get_task: Mcp error: -32602: …") (#177).
+#[tokio::test]
+async fn the_proxy_forwards_the_bus_error_unchanged() {
+    let h = require_db!("t_proxy_error_passthrough");
+    let token = seed_agent(&h.pool, "acme", "bob").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "bob", &token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let proxy = spawn_proxy(&dir, &repo, &["--host-session", "conv-passthrough"], &[]).await;
+    let direct = connect(&h.base, &token).await;
+
+    let missing = json!({"key": format!("nope-{}", Uuid::new_v4().simple())});
+    let from_bus = call_error_data(&direct, "get_task", missing.clone()).await;
+    let via_proxy = call_error_data(&proxy, "get_task", missing).await;
+    assert_eq!(
+        via_proxy.code, from_bus.code,
+        "the bus's code, not an internal error"
+    );
+    assert_eq!(
+        via_proxy.message, from_bus.message,
+        "the bus's words, untouched"
+    );
+    for noise in ["Mcp error", "-32602", "get_task:"] {
+        assert!(
+            !via_proxy.message.contains(noise),
+            "transport rendering reached the model ({noise:?}): {}",
+            via_proxy.message
+        );
+    }
+
+    let _ = proxy.cancel().await;
+    let _ = direct.cancel().await;
+    h.shutdown().await;
+}
+
+/// A proxy that loses the bus says so once, in the caller's terms, and
+/// without the transport's internals: no URL, no OS error, no rmcp error
+/// type. What the caller needs to act safely is that the call may or may
+/// not have run (#177).
+#[tokio::test]
+async fn a_proxy_that_loses_the_bus_says_so_without_transport_detail() {
+    let h = require_db!("t_proxy_lost_bus");
+    let token = seed_agent(&h.pool, "acme", "bob").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "bob", &token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let proxy = spawn_proxy(&dir, &repo, &["--host-session", "conv-lost-bus"], &[]).await;
+    let me = call(&proxy, "whoami", json!({})).await;
+    assert_eq!(
+        me["agent"], "bob",
+        "connected before the bus goes away: {me}"
+    );
+
+    // The bus goes away under a connected proxy.
+    h.shutdown().await;
+
+    let lost = call_error_data(&proxy, "get_task", json!({"key": "anything"})).await;
+    assert_eq!(
+        lost.code,
+        rmcp::model::ErrorCode::INTERNAL_ERROR,
+        "{lost:?}"
+    );
+    assert!(
+        lost.message.contains("could not reach the bus"),
+        "{}",
+        lost.message
+    );
+    assert!(
+        lost.message.contains("may or may not have run"),
+        "{}",
+        lost.message
+    );
+    for internal in [
+        "Transport",
+        "error sending request",
+        "http://",
+        "onnection refused",
+        "Mcp error",
+    ] {
+        assert!(
+            !lost.message.contains(internal),
+            "transport internals reached the model ({internal:?}): {}",
+            lost.message
+        );
+    }
+
+    let _ = proxy.cancel().await;
+}
+
+/// A registration the bus refuses is reported by `session_status` in the
+/// bus's own words, which say what to do, and without rmcp's rendering of
+/// the JSON-RPC code around them (#177).
+#[tokio::test]
+async fn session_status_reports_a_registration_refusal_in_the_bus_words() {
+    let h = require_db!("t_proxy_register_refused");
+    let token = seed_agent(&h.pool, "acme", "bob").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "bob", &token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+
+    // Someone holding the agent token already registered the label this
+    // conversation maps to, so the proxy's own registration is refused.
+    let label = ai_crew_sync::context::session_for_host("conv-taken");
+    let agent = connect(&h.base, &token).await;
+    let taken = call(&agent, "register_session", json!({"session": label})).await;
+    assert!(taken["session_token"].is_string(), "{taken}");
+
+    let proxy = spawn_proxy(&dir, &repo, &["--host-session", "conv-taken"], &[]).await;
+    let status = call(&proxy, "session_status", json!({})).await;
+    assert_eq!(status["connected"], false, "{status}");
+    let error = status["error"].as_str().expect("the refusal is reported");
+    assert!(
+        error.contains("already registered and still live"),
+        "the bus's own words reach the model: {error}"
+    );
+    for noise in ["Mcp error", "-32602", "-32600"] {
+        assert!(
+            !error.contains(noise),
+            "transport rendering reached the model ({noise:?}): {error}"
+        );
+    }
+
+    let _ = proxy.cancel().await;
+    let _ = agent.cancel().await;
+    h.shutdown().await;
+}
+
+/// A request the bus refuses over HTTP before running anything (here the
+/// body limit, 64 KiB in this harness) reaches the model through the proxy
+/// in the bus's own words, and says the call did not run. rmcp hands such
+/// an answer back as a transport error, which the proxy used to report as
+/// a lost connection where "may or may not have run" sent the model off to
+/// check for a post that never happened (#178 review).
+#[tokio::test]
+async fn a_proxy_forwards_the_bus_http_refusal_and_says_nothing_ran() {
+    let h = match setup_rate_limited("t_proxy_http_refusal", 0).await {
+        Some(h) => h,
+        None => {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        }
+    };
+    let token = seed_agent(&h.pool, "acme", "bob").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "bob", &token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let proxy = spawn_proxy(&dir, &repo, &["--host-session", "conv-refused"], &[]).await;
+
+    let huge = "x".repeat(100 * 1024);
+    let refused = call_error_data(
+        &proxy,
+        "post_message",
+        json!({"channel": "general", "body": huge}),
+    )
+    .await;
+    assert_eq!(
+        refused.code,
+        rmcp::model::ErrorCode::INVALID_REQUEST,
+        "{refused:?}"
+    );
+    assert!(
+        refused.message.contains("request body is too large") && refused.message.contains("65536"),
+        "the bus's own words reach the model: {}",
+        refused.message
+    );
+    assert!(
+        refused.message.contains("before running it"),
+        "the model is told nothing ran: {}",
+        refused.message
+    );
+    for noise in [
+        "may or may not have run",
+        "could not reach the bus",
+        "HTTP 413",
+        "Transport",
+        "http://",
+    ] {
+        assert!(
+            !refused.message.contains(noise),
+            "a refusal read as a lost connection ({noise:?}): {}",
+            refused.message
+        );
+    }
+    let (posted,): (i64,) = sqlx::query_as("SELECT count(*) FROM messages")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(posted, 0, "the refusal is true: nothing was posted");
+    // The proxy is still connected; the refusal was not a lost bus.
+    assert_eq!(call(&proxy, "whoami", json!({})).await["agent"], "bob");
+
+    let _ = proxy.cancel().await;
+    h.shutdown().await;
+}
+
+/// The same refusal at connect time: a token already throttled when the
+/// proxy starts is reported by `session_status` in the bus's words, not as
+/// a connection that failed, and without the bus's URL (#178 review).
+#[tokio::test]
+async fn session_status_reports_an_http_refusal_at_connect_in_the_bus_words() {
+    let h = match setup_rate_limited("t_proxy_connect_refused", 1).await {
+        Some(h) => h,
+        None => {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        }
+    };
+    let token = seed_agent(&h.pool, "acme", "bob").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "bob", &token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+
+    // Spend the token's burst so the proxy's first request is throttled.
+    let http = reqwest::Client::new();
+    let mut throttled = false;
+    for _ in 0..40 {
+        let resp = http
+            .post(format!("{}/mcp", h.base))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/json, text/event-stream")
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                          "params":{"name":"whoami","arguments":{}}}))
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == 429 {
+            throttled = true;
+            break;
+        }
+    }
+    assert!(throttled, "a burst of 40 must exhaust a 1/min bucket");
+
+    let proxy = spawn_proxy(&dir, &repo, &["--host-session", "conv-throttled"], &[]).await;
+    let status = call(&proxy, "session_status", json!({})).await;
+    assert_eq!(status["connected"], false, "{status}");
+    let error = status["error"].as_str().expect("the refusal is reported");
+    assert!(
+        error.contains("rate limit exceeded"),
+        "the bus's own words reach the model: {error}"
+    );
+    for noise in [
+        "failed before an answer came back",
+        "HTTP 429",
+        "Transport",
+        "http://",
+        h.base.as_str(),
+    ] {
+        assert!(
+            !error.contains(noise),
+            "a refusal read as a lost connection ({noise:?}): {error}"
+        );
+    }
+
+    let _ = proxy.cancel().await;
+    h.shutdown().await;
+}
+
+/// Wait until some backend is blocked behind `blocker_pid`, so the call
+/// under test is parked exactly where the test holds it open. Keyed on the
+/// blocker's pid, so a lock wait in another test's schema never counts.
+async fn wait_until_blocked_by(pool: &PgPool, blocker_pid: i32) {
+    for _ in 0..400 {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(blocker_pid)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("nothing ever waited on the blocking transaction");
+}
+
+/// Make every insert into `table` in this test's schema fail, optionally
+/// only for rows matching `when` (a trigger WHEN condition on NEW).
+async fn inject_insert_failure(pool: &PgPool, table: &str, when: Option<&str>) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION injected_failure() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let when = when.map(|w| format!("WHEN ({w})")).unwrap_or_default();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER injected_failure BEFORE INSERT ON {table} FOR EACH ROW {when} \
+         EXECUTE FUNCTION injected_failure()"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn lift_insert_failure(pool: &PgPool, table: &str) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER injected_failure ON {table}"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A task declared with `depends_on` is never claimable before its
+/// dependencies are recorded. `create_task` used to commit the task row and
+/// then write its `task_deps` rows one by one, so in between the task was
+/// open and dependency-free and both claim paths handed it out (#179). The
+/// window is held open from another transaction: EXCLUSIVE on `task_deps`
+/// parks the dependency insert (ROW EXCLUSIVE) but not the claims'
+/// `NOT EXISTS` read (ACCESS SHARE).
+#[tokio::test]
+async fn a_task_is_never_claimable_before_its_dependencies_are_recorded() {
+    let h = require_db!("t_deps_atomic");
+    let a = seed_agent(&h.pool, "acme", "joaquin").await;
+    let b = seed_agent(&h.pool, "acme", "marta").await;
+    let joaquin = connect(&h.base, &a).await;
+    let marta = connect(&h.base, &b).await;
+
+    call(
+        &joaquin,
+        "create_task",
+        json!({"key": "migrate-schema", "title": "migrate the users schema"}),
+    )
+    .await;
+    // Held, so claim_next_task has nothing older to hand out first.
+    let held = call(&joaquin, "claim_task", json!({"key": "migrate-schema"})).await;
+    assert_eq!(held["claimed"], true, "{held}");
+
+    let mut blocker = h.pool.begin().await.unwrap();
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    sqlx::query("LOCK TABLE task_deps IN EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let creator = tokio::spawn(async move {
+        let created = call(
+            &joaquin,
+            "create_task",
+            json!({"key": "update-clients", "title": "update the API clients",
+                   "depends_on": ["migrate-schema"]}),
+        )
+        .await;
+        (joaquin, created)
+    });
+    wait_until_blocked_by(&h.pool, blocker_pid).await;
+
+    // The create is parked on its dependency insert. Whatever the task looks
+    // like from outside now, it must not be claimable.
+    let next = call(&marta, "claim_next_task", json!({})).await;
+    let named = marta
+        .call_tool(
+            CallToolRequestParams::new("claim_task")
+                .with_arguments(serde_json::from_value(json!({"key": "update-clients"})).unwrap()),
+        )
+        .await;
+
+    blocker.rollback().await.unwrap();
+    let (joaquin, created) = creator.await.unwrap();
+
+    assert_eq!(
+        next["claimed"], false,
+        "claim_next_task handed out a task before its dependency was recorded: {next}"
+    );
+    match named {
+        // Not visible yet: the task does not exist for anyone until its
+        // dependencies do.
+        Err(e) => assert!(e.to_string().contains("not found"), "{e}"),
+        Ok(r) if r.is_error == Some(true) => {
+            let said = format!("{:?}", r.content);
+            assert!(said.contains("not found"), "{said}");
+        }
+        // Visible: then it must already be refused on its dependency.
+        Ok(r) => {
+            let v = r.structured_content.unwrap_or_default();
+            assert_eq!(
+                v["claimed"], false,
+                "claim_task took a task before its dependency was recorded: {v}"
+            );
+            assert!(
+                v["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("migrate-schema"),
+                "{v}"
+            );
+        }
+    }
+
+    // Once the create returns, the task carries its dependency and stays
+    // blocked on it.
+    assert_eq!(created["depends_on"][0], "migrate-schema", "{created}");
+    assert_eq!(created["blocked"], true, "{created}");
+    let denied = call(&marta, "claim_task", json!({"key": "update-clients"})).await;
+    assert_eq!(denied["claimed"], false, "{denied}");
+    assert!(
+        denied["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("migrate-schema"),
+        "{denied}"
+    );
+
+    let _ = joaquin.cancel().await;
+    let _ = marta.cancel().await;
+    h.shutdown().await;
+}
+
+/// A create that fails after the task row is written leaves nothing behind:
+/// no task, no event, so the same call retried succeeds instead of hitting
+/// "already exists" on an orphan that was claimable with no dependencies
+/// (#179).
+#[tokio::test]
+async fn a_failed_create_leaves_no_task_behind_and_a_retry_succeeds() {
+    let h = require_db!("t_create_rollback");
+    let a = seed_agent(&h.pool, "acme", "joaquin").await;
+    let joaquin = connect(&h.base, &a).await;
+    call(
+        &joaquin,
+        "create_task",
+        json!({"key": "migrate-schema", "title": "migrate the users schema"}),
+    )
+    .await;
+    let events_before: i64 = sqlx::query_scalar("SELECT count(*) FROM task_events")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+
+    let request = json!({"key": "update-clients", "title": "update the API clients",
+                         "depends_on": ["migrate-schema"]});
+    inject_insert_failure(&h.pool, "task_deps", None).await;
+    let err = call_expect_error(&joaquin, "create_task", request.clone()).await;
+    assert!(err.contains("database error"), "{err}");
+
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks WHERE key = 'update-clients'")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "a failed create left its task behind");
+    let events_after: i64 = sqlx::query_scalar("SELECT count(*) FROM task_events")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(events_after, events_before, "and no history for it");
+
+    lift_insert_failure(&h.pool, "task_deps").await;
+    let created = call(&joaquin, "create_task", request).await;
+    assert_eq!(created["depends_on"][0], "migrate-schema", "{created}");
+    assert_eq!(created["blocked"], true, "{created}");
+
+    let _ = joaquin.cancel().await;
+    h.shutdown().await;
+}
+
+/// A claim whose history entry cannot be written does not stand. The
+/// `claimed` event used to be written after the claim committed, so the
+/// caller was told "database error" while holding the lease (#179).
+#[tokio::test]
+async fn a_claim_whose_event_cannot_be_recorded_does_not_stand() {
+    let h = require_db!("t_claim_event_atomic");
+    let a = seed_agent(&h.pool, "acme", "joaquin").await;
+    let joaquin = connect(&h.base, &a).await;
+    call(
+        &joaquin,
+        "create_task",
+        json!({"key": "deploy-api", "title": "deploy the API"}),
+    )
+    .await;
+
+    inject_insert_failure(&h.pool, "task_events", Some("NEW.event = 'claimed'")).await;
+    let err = call_expect_error(&joaquin, "claim_task", json!({"key": "deploy-api"})).await;
+    assert!(err.contains("database error"), "{err}");
+    let task = call(&joaquin, "get_task", json!({"key": "deploy-api"})).await;
+    assert_eq!(
+        task["task"]["status"], "open",
+        "a claim reported as failed stood: {task}"
+    );
+    assert!(task["task"]["claimed_by"].is_null(), "{task}");
+
+    // The other claim path, on the same task.
+    let err = call_expect_error(&joaquin, "claim_next_task", json!({})).await;
+    assert!(err.contains("database error"), "{err}");
+    let task = call(&joaquin, "get_task", json!({"key": "deploy-api"})).await;
+    assert_eq!(task["task"]["status"], "open", "{task}");
+
+    lift_insert_failure(&h.pool, "task_events").await;
+    let claimed = call(&joaquin, "claim_task", json!({"key": "deploy-api"})).await;
+    assert_eq!(claimed["claimed"], true, "{claimed}");
+
+    let _ = joaquin.cancel().await;
+    h.shutdown().await;
+}
+
+/// A note write that cannot record its revision changes nothing: the value
+/// and its revision used to commit separately, so a failure between them
+/// left an overwrite with no revision to recover the old value from (#179).
+#[tokio::test]
+async fn a_note_write_that_cannot_record_its_revision_changes_nothing() {
+    let h = require_db!("t_note_revision_atomic");
+    let a = seed_agent(&h.pool, "acme", "joaquin").await;
+    let joaquin = connect(&h.base, &a).await;
+    let note = json!({"scope": "api", "key": "cache-backend"});
+    call(
+        &joaquin,
+        "set_note",
+        json!({"scope": "api", "key": "cache-backend", "value": "valkey"}),
+    )
+    .await;
+
+    inject_insert_failure(&h.pool, "note_revisions", None).await;
+    let err = call_expect_error(
+        &joaquin,
+        "set_note",
+        json!({"scope": "api", "key": "cache-backend", "value": "memcached"}),
+    )
+    .await;
+    assert!(err.contains("database error"), "{err}");
+
+    let read = call(&joaquin, "get_note", note.clone()).await;
+    assert_eq!(read["note"]["value"], "valkey", "{read}");
+    let revisions: i64 = sqlx::query_scalar("SELECT count(*) FROM note_revisions")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(revisions, 1, "only the first write has a revision");
+
+    lift_insert_failure(&h.pool, "note_revisions").await;
+    call(
+        &joaquin,
+        "set_note",
+        json!({"scope": "api", "key": "cache-backend", "value": "memcached"}),
+    )
+    .await;
+    let read = call(&joaquin, "get_note", note).await;
+    assert_eq!(read["note"]["value"], "memcached", "{read}");
+    let revisions: i64 = sqlx::query_scalar("SELECT count(*) FROM note_revisions")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(revisions, 2, "{revisions}");
+
+    let _ = joaquin.cancel().await;
+    h.shutdown().await;
+}
+
+/// Two creates of one key race to the same conflict the sequential case
+/// gets. The existence check used to be a separate read, so the loser
+/// passed it, then hit the unique index and answered "database error"
+/// (#179).
+#[tokio::test]
+async fn two_creates_of_one_key_race_to_a_conflict() {
+    let h = require_db!("t_create_race");
+    let a = seed_agent(&h.pool, "acme", "joaquin").await;
+    let joaquin = connect(&h.base, &a).await;
+    let team_id: Uuid = sqlx::query_scalar("SELECT id FROM teams WHERE slug = 'acme'")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+
+    // The winner, still in flight.
+    let mut winner = h.pool.begin().await.unwrap();
+    let winner_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *winner)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO tasks (team_id, key, title) VALUES ($1, 'deploy-api', 'first')")
+        .bind(team_id)
+        .execute(&mut *winner)
+        .await
+        .unwrap();
+
+    let loser = tokio::spawn(async move {
+        let err = call_expect_error(
+            &joaquin,
+            "create_task",
+            json!({"key": "deploy-api", "title": "second"}),
+        )
+        .await;
+        (joaquin, err)
+    });
+    wait_until_blocked_by(&h.pool, winner_pid).await;
+    winner.commit().await.unwrap();
+    let (joaquin, err) = loser.await.unwrap();
+
+    assert!(err.contains("already exists"), "{err}");
+    assert!(!err.contains("database error"), "{err}");
+
+    let _ = joaquin.cancel().await;
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_handshake_names_the_bus_and_its_version() {
+    let h = require_db!("t_handshake_version");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+
+    // Any client — the 0.6.1 plugin's direct HTTP shape included — learns
+    // the real server and version from `initialize`, not the framework's
+    // name. This is what lets a failure later point at version skew
+    // instead of starting the search at the token and the TLS (#187).
+    let client = connect(&h.base, &token).await;
+    let info = client.peer_info().expect("initialize result");
+    let si = info
+        .server_info
+        .as_ref()
+        .expect("serverInfo is present in the handshake");
+    assert_eq!(si.name, "ai-crew-sync");
+    assert_eq!(si.version, env!("CARGO_PKG_VERSION"));
+
+    let _ = client.cancel().await;
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn verify_failure_names_url_and_credential_provenance() {
+    let h = require_db!("t_verify_provenance");
+    let _ = seed_agent(&h.pool, "acme", "joaquin").await;
+
+    // A leftover environment token from a previous release: the bus refuses
+    // it, and the error must say where the credential and the URL came
+    // from — without printing the credential.
+    let bad = "acs_0000000000000000000000000000000000000000000000000000000000000000";
+    let resolved = ai_crew_sync::context::Resolved {
+        mcp_url: format!("{}/mcp", h.base),
+        token: bad.to_owned(),
+        source: ai_crew_sync::context::Source::Explicit,
+        profile: None,
+        expected: None,
+        tokens_file: None,
+        token_key: None,
+        project: None,
+        channel: None,
+        project_root: None,
+        session: None,
+        token_origin: Some(ai_crew_sync::context::Origin::Environment),
+        url_origin: Some(ai_crew_sync::context::Origin::Environment),
+        warnings: Vec::new(),
+    };
+    let err = format!(
+        "{:#}",
+        ai_crew_sync::context::verify(&resolved)
+            .await
+            .expect_err("a wrong token must not verify")
+    );
+    assert!(err.contains(&format!("{}/mcp", h.base)), "{err}");
+    assert!(err.contains("BUS_TOKEN (environment)"), "{err}");
+    assert!(err.contains("BUS_URL (environment)"), "{err}");
+    assert!(!err.contains(bad), "the credential never crosses: {err}");
+
+    // The same refusal through a profile names the entry and the file the
+    // operator has to fix, still never the secret.
+    let resolved = ai_crew_sync::context::Resolved {
+        mcp_url: format!("{}/mcp", h.base),
+        token: bad.to_owned(),
+        source: ai_crew_sync::context::Source::UserDefault,
+        profile: Some("acme".into()),
+        expected: Some(("acme".into(), "joaquin".into())),
+        tokens_file: Some(std::path::PathBuf::from("/tmp/tokens-acme")),
+        token_key: Some("_base".into()),
+        project: None,
+        channel: None,
+        project_root: None,
+        session: None,
+        token_origin: None,
+        url_origin: None,
+        warnings: Vec::new(),
+    };
+    let err = format!(
+        "{:#}",
+        ai_crew_sync::context::verify(&resolved)
+            .await
+            .expect_err("a wrong token must not verify")
+    );
+    assert!(err.contains("entry '_base'"), "{err}");
+    assert!(err.contains("tokens-acme"), "{err}");
+    assert!(err.contains("profile 'acme'"), "{err}");
+    assert!(!err.contains(bad), "{err}");
+
     h.shutdown().await;
 }
 

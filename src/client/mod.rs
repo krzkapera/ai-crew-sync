@@ -26,13 +26,33 @@ use serde_json::{Value, json};
 
 #[derive(Args)]
 pub struct ClientArgs {
-    /// URL of the bus MCP endpoint, e.g. https://bus.example.com/mcp
-    #[arg(long, env = "BUS_URL", default_value = "http://localhost:8787/mcp")]
-    pub url: String,
+    /// URL of the bus MCP endpoint, e.g. https://bus.example.com/mcp. Omit
+    /// it to take the endpoint from the selected profile.
+    #[arg(long, env = "BUS_URL")]
+    pub url: Option<String>,
 
-    /// Your agent token (issued with `ai-crew-sync token issue`).
+    /// Your agent token (issued with `ai-crew-sync token issue`). Omit it to
+    /// use a local profile: `--profile`, the project's .acs.toml, or the
+    /// user default (see `ai-crew-sync context show`).
     #[arg(long, env = "BUS_TOKEN", hide_env_values = true)]
-    pub token: String,
+    pub token: Option<String>,
+
+    /// Connect with this local profile (from `context profile add`).
+    /// Passing it together with --token is a contradiction and is refused,
+    /// so it is always clear which identity a window uses.
+    #[arg(long, env = "BUS_PROFILE")]
+    pub profile: Option<String>,
+
+    /// Directory whose project defaults (.acs.toml) apply; the current
+    /// directory by default.
+    #[arg(long, env = "BUS_PROJECT_DIR")]
+    pub project_dir: Option<std::path::PathBuf>,
+
+    /// Id of the host conversation this call belongs to. It derives the same
+    /// bus session the proxy of that conversation uses, so a lifecycle hook
+    /// reads and writes that window's context and nobody else's.
+    #[arg(long, env = "BUS_HOST_SESSION")]
+    pub host_session: Option<String>,
 
     /// Which working context this is — usually the repository name. Separates
     /// your presence, task claims and locks from your other sessions. Omit it
@@ -131,6 +151,17 @@ pub enum ClientCmd {
         #[arg(long)]
         online: bool,
     },
+    /// Every session in the team with its exact address, project and role.
+    Sessions {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long)]
+        online: bool,
+        #[arg(long)]
+        limit: Option<i64>,
+    },
     /// Publish your own presence.
     Beat {
         #[arg(long)]
@@ -141,6 +172,11 @@ pub enum ClientCmd {
         branch: Option<String>,
         #[arg(long)]
         activity: Option<String>,
+        /// Discovery labels (see `sessions`). Pass "" to clear.
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
         #[arg(long)]
         ttl_seconds: Option<i64>,
     },
@@ -282,14 +318,37 @@ pub enum NoteCmd {
 pub mod mapping;
 pub mod render;
 
-use mapping::to_call;
+use mapping::{Defaults, to_call_with};
 use render::render;
 
 pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
-    let mut config = StreamableHttpClientTransportConfig::with_uri(args.url.clone());
-    config.auth_header = Some(args.token.clone());
+    // Where to connect and as whom: explicit flags first, then the local
+    // profiles and the project's defaults. `context` owns the order.
+    let resolved = crate::context::resolve(&crate::context::Inputs {
+        config_dir: crate::context::config_dir()?,
+        explicit_url: args.url.clone(),
+        url_origin: args
+            .url
+            .as_deref()
+            .map(|v| crate::context::Origin::of("BUS_URL", v)),
+        explicit_token: args.token.clone(),
+        token_origin: args
+            .token
+            .as_deref()
+            .map(|v| crate::context::Origin::of("BUS_TOKEN", v)),
+        explicit_session: args.session.clone(),
+        profile: args.profile.clone(),
+        project_dir: args.project_dir.clone(),
+        host_session: args.host_session.clone(),
+    })?;
+    // Shadow warnings go to stderr: stdout is the command's parseable answer.
+    for w in &resolved.warnings {
+        eprintln!("warning: {w}");
+    }
+    let mut config = StreamableHttpClientTransportConfig::with_uri(resolved.mcp_url.clone());
+    config.auth_header = Some(resolved.token.clone());
     config.allow_stateless = true;
-    if let Some(session) = args
+    if let Some(session) = resolved
         .session
         .as_deref()
         .map(str::trim)
@@ -309,7 +368,10 @@ pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
         .await
         .context("could not connect to the bus (check --url and --token)")?;
 
-    let outcome = run_command(&client, &args).await;
+    let defaults = Defaults {
+        channel: resolved.channel.clone(),
+    };
+    let outcome = run_command(&client, &args, &defaults).await;
     let _ = client.cancel().await;
     outcome
 }
@@ -317,6 +379,7 @@ pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
 async fn run_command(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ClientConfig>,
     args: &ClientArgs,
+    defaults: &Defaults,
 ) -> anyhow::Result<()> {
     // `tools` is the one command that is not a tool call.
     if matches!(args.command, ClientCmd::Tools) {
@@ -348,7 +411,7 @@ async fn run_command(
             // `tools` is handled above and is the only command that maps to
             // nothing; anything else reaching here without a mapping is a
             // missing match arm, and says so instead of panicking.
-            let Some((tool, call_args)) = to_call(other)? else {
+            let Some((tool, call_args)) = to_call_with(other, defaults)? else {
                 bail!("this subcommand has no MCP tool mapping yet");
             };
             (tool.to_string(), call_args)

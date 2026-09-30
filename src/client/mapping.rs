@@ -50,7 +50,22 @@ pub(super) fn attachment_json(
     }))
 }
 
-pub(super) fn to_call(cmd: &ClientCmd) -> anyhow::Result<Option<(&'static str, Value)>> {
+/// The project's defaults, threaded into the calls that can use them. Only
+/// what the resolver proved local and trusted: a repository names a channel,
+/// it never names a credential.
+#[derive(Clone, Debug, Default)]
+pub struct Defaults {
+    pub channel: Option<String>,
+}
+
+pub fn to_call(cmd: &ClientCmd) -> anyhow::Result<Option<(&'static str, Value)>> {
+    to_call_with(cmd, &Defaults::default())
+}
+
+pub fn to_call_with(
+    cmd: &ClientCmd,
+    defaults: &Defaults,
+) -> anyhow::Result<Option<(&'static str, Value)>> {
     let (tool, args): (&str, Value) = match cmd {
         ClientCmd::Whoami => ("whoami", json!({})),
         ClientCmd::Tools => return Ok(None),
@@ -66,6 +81,15 @@ pub(super) fn to_call(cmd: &ClientCmd) -> anyhow::Result<Option<(&'static str, V
                 .iter()
                 .map(|p| attachment_json(p, None))
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            // A message with neither --channel nor --to falls back to the
+            // project's channel, which is what .acs.toml is for. With --to
+            // it stays a direct message, and an explicit --channel wins.
+            let channel = match (channel, to) {
+                (Some(c), _) => Some(c.clone()),
+                (None, Some(_)) => None,
+                (None, None) => defaults.channel.clone(),
+            };
+            let channel = &channel;
             (
                 "post_message",
                 json!({
@@ -115,17 +139,29 @@ pub(super) fn to_call(cmd: &ClientCmd) -> anyhow::Result<Option<(&'static str, V
             ("create_channel", json!({"name": name, "topic": topic}))
         }
         ClientCmd::Agents { online } => ("list_agents", json!({"online_only": online})),
+        ClientCmd::Sessions {
+            project,
+            role,
+            online,
+            limit,
+        } => (
+            "list_sessions",
+            json!({"project": project, "role": role, "online_only": online, "limit": limit}),
+        ),
         ClientCmd::Beat {
             status,
             repo,
             branch,
             activity,
+            project,
+            role,
             ttl_seconds,
         } => (
             "heartbeat",
             json!({
                 "status": status, "repo": repo, "branch": branch,
-                "activity": activity, "ttl_seconds": ttl_seconds
+                "activity": activity, "project": project, "role": role,
+                "ttl_seconds": ttl_seconds
             }),
         ),
         ClientCmd::Tasks { status, mine } => {
@@ -265,11 +301,19 @@ mod tests {
                 topic: None,
             },
             ClientCmd::Agents { online: false },
+            ClientCmd::Sessions {
+                project: None,
+                role: None,
+                online: false,
+                limit: None,
+            },
             ClientCmd::Beat {
                 status: None,
                 repo: None,
                 branch: None,
                 activity: None,
+                project: None,
+                role: None,
                 ttl_seconds: None,
             },
             ClientCmd::Tasks {

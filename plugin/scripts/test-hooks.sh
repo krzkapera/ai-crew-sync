@@ -360,13 +360,234 @@ out="$(printf '{"session_id":"sess-f"}' \
 [ -z "$out" ] && ok "no BUS_URL/BUS_TOKEN means the hook does nothing" \
     || bad "drain without a configured bus" "$out"
 
+# --- bus-call.sh: which mode it picks, and what it passes on ----------------
+# The real script this time, not the fake: the point is the routing.
+cp "$ROOT/bus-call.sh" "$WORK/bin/real-bus-call.sh"
+mkdir -p "$WORK/fakebin"
+cat > "$WORK/fakebin/ai-crew-sync" <<'FAKE'
+#!/bin/sh
+# Records the environment the hook path would carry and answers like the
+# console client with --json: the tool's structured content.
+{
+    printf 'host=%s ' "${BUS_HOST_SESSION:-}"
+    printf 'session=%s ' "${BUS_SESSION:-}"
+    printf 'args=%s
+' "$*"
+} >> "$CALLS"
+echo '{"agent":"joaquin","team":"acme","session":"s-abc123"}'
+FAKE
+chmod +x "$WORK/fakebin/ai-crew-sync"
+export CALLS="$WORK/calls.txt"
+
+# No token exported and the binary present: profiles path, conversation id
+# passed through, and the JSON-RPC envelope every caller parses.
+: > "$CALLS"
+out="$(env -u BUS_TOKEN -u BUS_URL PATH="$WORK/fakebin:$PATH"     BUS_HOST_SESSION=conv-7 sh "$WORK/bin/real-bus-call.sh" whoami 2>/dev/null)"
+case "$out" in
+    *'"structuredContent"'*'"joaquin"'*) ok "binary path wraps the reply for callers" ;;
+    *) bad "binary path reply" "$out" ;;
+esac
+case "$(cat "$CALLS")" in
+    *"host=conv-7"*"client --json call whoami"*) ok "the conversation id reaches the client" ;;
+    *) bad "conversation id not passed" "$(cat "$CALLS")" ;;
+esac
+
+# An exported BUS_TOKEN keeps the legacy curl path, even with the binary on
+# the PATH: an operator's explicit credential is never silently replaced.
+: > "$CALLS"
+out="$(PATH="$WORK/fakebin:$PATH" BUS_TOKEN=acs_legacy BUS_URL=http://127.0.0.1:1     BUS_TIMEOUT=1 sh "$WORK/bin/real-bus-call.sh" whoami 2>/dev/null || true)"
+[ ! -s "$CALLS" ] && ok "an exported token keeps the legacy curl path"     || bad "legacy path bypassed" "$(cat "$CALLS")"
+
+# Neither a token nor the binary: silent, like every other unconfigured case.
+out="$(env -u BUS_TOKEN -u BUS_URL PATH="$WORK/empty"     sh "$WORK/bin/real-bus-call.sh" whoami 2>/dev/null || true)"
+[ -z "$out" ] && ok "no binary and no token means no call"     || bad "unconfigured bus-call" "$out"
+
+# --- omitted arguments are an empty object, on every sh ------------------------
+# The real bus-call.sh, with the recording curl on the PATH: the JSON it sends
+# for `whoami` with no arguments, an empty argument and an explicit object
+# must parse, and must carry an empty object.
+mkdir -p "$WORK/argbin"
+cat > "$WORK/argbin/curl" <<'FAKE'
+#!/bin/sh
+while [ $# -gt 0 ]; do
+    if [ "$1" = "--data" ]; then printf '%s' "$2" > "$SENT"; fi
+    shift
+done
+FAKE
+chmod +x "$WORK/argbin/curl"
+export SENT="$WORK/sent.json"
+for variant in omitted empty explicit; do
+    : > "$SENT"
+    case "$variant" in
+        omitted)  (PATH="$WORK/argbin:$PATH" BUS_URL=http://127.0.0.1:1/mcp BUS_TOKEN=acs_x sh "$ROOT/bus-call.sh" whoami) >/dev/null 2>&1 || true ;;
+        empty)    (PATH="$WORK/argbin:$PATH" BUS_URL=http://127.0.0.1:1/mcp BUS_TOKEN=acs_x sh "$ROOT/bus-call.sh" whoami "") >/dev/null 2>&1 || true ;;
+        explicit) (PATH="$WORK/argbin:$PATH" BUS_URL=http://127.0.0.1:1/mcp BUS_TOKEN=acs_x sh "$ROOT/bus-call.sh" whoami '{}') >/dev/null 2>&1 || true ;;
+    esac
+    SENT="$SENT" python3 -c '
+import json, os
+body = json.load(open(os.environ["SENT"]))
+assert body["params"]["name"] == "whoami", body
+assert body["params"]["arguments"] == {}, body
+' 2>/dev/null && ok "bus-call sends an empty object for $variant arguments" \
+        || bad "bus-call arguments ($variant)" "$(cat "$SENT")"
+done
+# The binary mode passes the same empty object on to the client.
+: > "$CALLS"
+out="$(env -u BUS_TOKEN -u BUS_URL PATH="$WORK/fakebin:$PATH" sh "$WORK/bin/real-bus-call.sh" whoami 2>/dev/null)"
+case "$(cat "$CALLS")" in
+    *"call whoami --args {}"*) ok "binary mode passes an empty object for omitted arguments" ;;
+    *) bad "binary mode arguments" "$(cat "$CALLS")" ;;
+esac
+
+# --- lifecycle hooks after a binding lost its credential ---------------------
+# The binary answers `context hook --event status` from an env var so each
+# binding state can be replayed; every other invocation is recorded. A curl
+# on the PATH records too, so a legacy request cannot hide behind the fake
+# bus-call.sh: with the real bus-call.sh both would show.
+# The drain tests above replaced the recording bus-call.sh with one that
+# answers; put the recorder back, or a legacy request would leave no trace.
+cat > "$WORK/bin/bus-call.sh" <<'FAKE'
+#!/bin/sh
+printf '%s\t%s\n' "$1" "${2:-{\}}" >> "$CAPTURE"
+FAKE
+chmod +x "$WORK/bin/bus-call.sh"
+mkdir -p "$WORK/statebin"
+cat > "$WORK/statebin/ai-crew-sync" <<'FAKE'
+#!/bin/sh
+printf 'args=%s\n' "$*" >> "$HOOKCALLS"
+case "$*" in
+    *"--event status"*) echo "{\"binding\":\"$2\",\"state\":\"${STUB_STATE:-missing}\"}" ;;
+esac
+FAKE
+cat > "$WORK/statebin/curl" <<'FAKE'
+#!/bin/sh
+printf 'curl %s\n' "$*" >> "$CURLCALLS"
+FAKE
+chmod +x "$WORK/statebin/ai-crew-sync" "$WORK/statebin/curl"
+export HOOKCALLS="$WORK/hookcalls.txt" CURLCALLS="$WORK/curlcalls.txt"
+
+lifecycle() { # <state> <status> <with-token|no-token>
+    : > "$CAPTURE"; : > "$HOOKCALLS"; : > "$CURLCALLS"
+    if [ "$3" = "with-token" ]; then
+        (cd "$REPO_DIR" && printf '{"session_id":"closed-window"}' | env -u BUS_HOST_SESSION \
+            STUB_STATE="$1" PATH="$WORK/statebin:$PATH" BUS_URL=http://127.0.0.1:1/mcp \
+            BUS_TOKEN=acs_parent_placeholder BUS_SESSION=legacy-shared \
+            sh "$WORK/bin/heartbeat.sh" "$2" --from-payload) >/dev/null 2>&1
+    else
+        (cd "$REPO_DIR" && printf '{"session_id":"closed-window"}' | env -u BUS_HOST_SESSION \
+            -u BUS_TOKEN -u BUS_URL -u BUS_SESSION STUB_STATE="$1" PATH="$WORK/statebin:$PATH" \
+            sh "$WORK/bin/heartbeat.sh" "$2" --from-payload) >/dev/null 2>&1
+    fi
+}
+for status in active idle; do
+    for creds in with-token no-token; do
+        lifecycle no-credential "$status" "$creds"
+        if [ ! -s "$CAPTURE" ] && [ ! -s "$CURLCALLS" ] \
+            && ! grep -q -- "--event heartbeat\|--event session_end" "$HOOKCALLS"; then
+            ok "$status heartbeat publishes nothing after no-credential ($creds)"
+        else
+            bad "$status heartbeat fell back after no-credential ($creds)" \
+                "$(cat "$CAPTURE" "$CURLCALLS" "$HOOKCALLS")"
+        fi
+    done
+done
+lifecycle authenticated active with-token
+grep -q -- "--binding closed-window --event heartbeat" "$HOOKCALLS" && [ ! -s "$CAPTURE" ] \
+    && ok "an authenticated binding still heartbeats as its own window" \
+    || bad "authenticated heartbeat" "$(cat "$HOOKCALLS" "$CAPTURE")"
+lifecycle authenticated idle with-token
+grep -q -- "--binding closed-window --event session_end" "$HOOKCALLS" && [ ! -s "$CAPTURE" ] \
+    && ok "an authenticated binding still ends its own session" \
+    || bad "authenticated session_end" "$(cat "$HOOKCALLS" "$CAPTURE")"
+lifecycle missing active with-token
+grep -q '^heartbeat' "$CAPTURE" \
+    && ok "a binding that never existed keeps the legacy heartbeat" \
+    || bad "missing binding lost the legacy path" "$(cat "$CAPTURE" "$HOOKCALLS")"
+
+: > "$CAPTURE"; : > "$HOOKCALLS"; : > "$CURLCALLS"
+out="$(cd "$REPO_DIR" && printf '{"session_id":"closed-window"}' | env -u BUS_HOST_SESSION \
+    STUB_STATE=no-credential PATH="$WORK/statebin:$PATH" BUS_URL=http://127.0.0.1:1/mcp \
+    BUS_TOKEN=acs_parent_placeholder BUS_SESSION=legacy-shared \
+    sh "$WORK/bin/stop-drain.sh" 2>/dev/null || true)"
+[ -z "$out" ] && [ ! -s "$CAPTURE" ] && [ ! -s "$CURLCALLS" ] \
+    && ok "the Stop drain reads nothing after no-credential" \
+    || bad "stop drain fell back after no-credential" "$out $(cat "$CAPTURE" "$CURLCALLS")"
+
+# --- an authenticated binding beats an exported token --------------------------
+# The stub answers status from STUB_STATE and, for `--event call`, records
+# the call and answers like the binary: the tool's structured content. With
+# BUS_TOKEN and a conflicting BUS_SESSION exported, the real bus-call.sh must
+# still go through the binding's window, and the Stop drain must read that
+# window's inbox. The credential is never on the command line.
+cat > "$WORK/statebin/ai-crew-sync" <<'FAKE'
+#!/bin/sh
+printf 'args=%s\n' "$*" >> "$HOOKCALLS"
+case "$*" in
+    *"--event status"*) echo "{\"binding\":\"$2\",\"state\":\"${STUB_STATE:-missing}\"}" ;;
+    *"--event call"*"--tool whoami"*) echo '{"agent":"bob","team":"acme","session":"s-window"}' ;;
+    *"--event call"*"--tool read_messages"*) echo '{"messages":[]}' ;;
+    *"--event call"*) echo '{}' ;;
+esac
+FAKE
+chmod +x "$WORK/statebin/ai-crew-sync"
+: > "$HOOKCALLS"; : > "$CURLCALLS"
+out="$(STUB_STATE=authenticated PATH="$WORK/statebin:$PATH" BUS_HOST_SESSION=conv-9 \
+    BUS_URL=http://127.0.0.1:1/mcp BUS_TOKEN=acs_parent BUS_SESSION=legacy-other \
+    sh "$ROOT/bus-call.sh" whoami 2>/dev/null)"
+case "$(cat "$HOOKCALLS")" in
+    *"--binding conv-9 --event call --tool whoami --args {}"*) ok "an authenticated binding beats an exported token" ;;
+    *) bad "binding not preferred" "$(cat "$HOOKCALLS")" ;;
+esac
+grep -q "acs_" "$HOOKCALLS" && bad "a credential reached the binary's command line" "$(cat "$HOOKCALLS")" \
+    || ok "no credential on the command line"
+[ ! -s "$CURLCALLS" ] && ok "no legacy request when the binding is authenticated" || bad "legacy request with a binding" "$(cat "$CURLCALLS")"
+case "$out" in
+    *'"structuredContent"'*'"bob"'*) ok "the binding path answers in the JSON-RPC envelope" ;;
+    *) bad "binding path envelope" "$out" ;;
+esac
+: > "$HOOKCALLS"; : > "$CURLCALLS"
+out="$(STUB_STATE=no-credential PATH="$WORK/statebin:$PATH" BUS_HOST_SESSION=conv-9 \
+    BUS_URL=http://127.0.0.1:1/mcp BUS_TOKEN=acs_parent BUS_SESSION=legacy-other \
+    sh "$ROOT/bus-call.sh" whoami 2>/dev/null || true)"
+[ -z "$out" ] && [ ! -s "$CURLCALLS" ] && ! grep -q -- "--event call" "$HOOKCALLS" \
+    && ok "a binding that lost its credential calls nothing, token or not" \
+    || bad "no-credential fell back" "$out $(cat "$CURLCALLS" "$HOOKCALLS")"
+: > "$HOOKCALLS"; : > "$CURLCALLS"
+out="$(STUB_STATE=missing PATH="$WORK/statebin:$PATH" BUS_HOST_SESSION=conv-9 \
+    BUS_URL=http://127.0.0.1:1/mcp BUS_TOKEN=acs_parent BUS_SESSION=legacy-other \
+    sh "$ROOT/bus-call.sh" whoami 2>/dev/null || true)"
+grep -q "^curl" "$CURLCALLS" && ok "a conversation with no binding keeps the legacy path" \
+    || bad "missing binding lost legacy" "$(cat "$CURLCALLS" "$HOOKCALLS")"
+# The Stop drain, end to end through the real bus-call.sh: both reads go
+# through the binding's window and none through the exported session.
+cp "$ROOT/bus-call.sh" "$WORK/bin/bus-call.sh"
+: > "$HOOKCALLS"; : > "$CURLCALLS"
+out="$(cd "$REPO_DIR" && printf '{"session_id":"conv-9"}' | env -u BUS_HOST_SESSION STUB_STATE=authenticated \
+    PATH="$WORK/statebin:$PATH" TMPDIR="$WORK" BUS_URL=http://127.0.0.1:1/mcp BUS_TOKEN=acs_parent \
+    BUS_SESSION=legacy-other sh "$WORK/bin/stop-drain.sh" 2>/dev/null || true)"
+grep -q -- "--event call --tool read_messages" "$HOOKCALLS" && grep -q -- "--event call --tool whoami" "$HOOKCALLS" \
+    && [ ! -s "$CURLCALLS" ] \
+    && ok "the Stop drain reads the binding's inbox, not the exported session's" \
+    || bad "stop drain routing" "$(cat "$HOOKCALLS" "$CURLCALLS")"
+# Put the recorder back for whatever runs after this section.
+cat > "$WORK/bin/bus-call.sh" <<'FAKE'
+#!/bin/sh
+printf '%s\t%s\n' "$1" "${2:-{\}}" >> "$CAPTURE"
+FAKE
+chmod +x "$WORK/bin/bus-call.sh"
+
 # --- every tool the hooks call exists in the served schema ------------------
 # Cheap coupling check: the tool names the scripts use must appear in the
 # server's tool router. Catches a rename before a user's session breaks.
 SRC="$ROOT/../../src/tools"
 if [ -d "$SRC" ]; then
     missing=""
-    for tool in whoami team_digest heartbeat list_tasks read_messages; do
+    for tool in whoami team_digest heartbeat list_tasks read_messages list_sessions \
+                list_agents list_channels create_channel post_message ask_agent \
+                claim_task claim_next_task get_task complete_task release_task renew_task_lease \
+                acquire_lock release_lock list_locks get_note set_note search_notes \
+                wait_for_updates create_conversation send_conversation_message \
+                list_conversations fetch_conversation_inbox read_conversation; do
         grep -rq "async fn $tool(" "$SRC" 2>/dev/null || missing="$missing $tool"
     done
     [ -z "$missing" ] && ok "tools the hooks and skill name exist server-side" \

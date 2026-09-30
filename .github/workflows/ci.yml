@@ -37,6 +37,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: stable
+      - name: JetStream fixture
+        # Required from phase 4 of ADR 0001: a broker test that skips itself
+        # proves nothing. The config file is the only way to raise
+        # max_payload, whose 1 MiB default refuses a 1 MiB body once envelope
+        # headers are added.
+        run: |
+          docker run -d --name acs-nats -p 4222:4222 \
+            -v "$PWD/Docker/nats-test.conf:/etc/nats/nats.conf:ro" \
+            nats:2.12-alpine -js -c /etc/nats/nats.conf
+          for i in $(seq 1 30); do
+            docker logs acs-nats 2>&1 | grep -q 'Server is ready' && exit 0
+            sleep 1
+          done
+          echo "the JetStream fixture never became ready"; docker logs acs-nats; exit 1
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -48,12 +62,14 @@ jobs:
           # Fail rather than silently pass zero integration tests if the
           # service container never came up.
           AI_CREW_SYNC_REQUIRE_DB: "1"
+          AI_CREW_SYNC_REQUIRE_NATS: "1"
+          TEST_NATS_URL: nats://127.0.0.1:4222
 
   # The floor declared in Cargo.toml. A dependency bump or a language feature
   # needing a newer compiler fails HERE rather than in a user's `cargo install`.
   # Raising this pin is a deliberate change — see the MSRV policy in the README.
   msrv:
-    name: MSRV 1.97.1 (build, tests)
+    name: MSRV 1.98.1 (build, tests)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -71,18 +87,28 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@1.98.1
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
       - name: Assert the pin matches Cargo.toml
         run: |
           declared=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
-          if [ "$declared" != "1.97.1" ]; then
-            echo "Cargo.toml declares rust-version = $declared but this job pins 1.97.1."
+          if [ "$declared" != "1.98.1" ]; then
+            echo "Cargo.toml declares rust-version = $declared but this job pins 1.98.1."
             echo "Update the toolchain here and the MSRV policy in the READMEs."
             exit 1
           fi
+      - name: JetStream fixture
+        run: |
+          docker run -d --name acs-nats -p 4222:4222 \
+            -v "$PWD/Docker/nats-test.conf:/etc/nats/nats.conf:ro" \
+            nats:2.12-alpine -js -c /etc/nats/nats.conf
+          for i in $(seq 1 30); do
+            docker logs acs-nats 2>&1 | grep -q 'Server is ready' && exit 0
+            sleep 1
+          done
+          echo "the JetStream fixture never became ready"; docker logs acs-nats; exit 1
       - name: Build
         run: cargo build --all-targets
       - name: Tests
@@ -92,16 +118,16 @@ jobs:
           # Fail rather than silently pass zero integration tests if the
           # service container never came up.
           AI_CREW_SYNC_REQUIRE_DB: "1"
+          AI_CREW_SYNC_REQUIRE_NATS: "1"
+          TEST_NATS_URL: nats://127.0.0.1:4222
 
-  # The compose files must render from their defaults alone — a bare `make up`
+  # The compose file must render from its defaults alone — a bare `make up`
   # has to boot on a machine with no .env at all.
   compose:
-    name: compose files render
+    name: compose file renders
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Validate
         run: |
           docker compose --project-directory . -f Docker/docker-compose.yml config -q
-          docker compose --project-directory . -f Docker/docker-compose.yml \
-            -f Docker/docker-compose.dev.yml config -q
