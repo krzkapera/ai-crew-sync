@@ -21,8 +21,8 @@ use super::{Bus, auth_of};
 use crate::{
     model::{
         ConversationInfo, ConversationList, ConversationRead, ConversationUpdates, InboxBatch,
-        InboxState, MessageReceipts, ProjectInfo, ProjectList, ReceiptInfo, SentMessage,
-        TransferResult,
+        InboxConfirmed, InboxState, LeftConversation, MessageReceipts, ProjectInfo, ProjectList,
+        ReceiptInfo, SentMessage, TransferResult,
     },
     store::{conversations as store, inbox},
 };
@@ -295,11 +295,13 @@ impl Bus {
         &self,
         ctx: RequestContext<rmcp::RoleServer>,
         Parameters(args): Parameters<ConversationIdArgs>,
-    ) -> Result<Json<serde_json::Value>, ErrorData> {
+    ) -> Result<Json<LeftConversation>, ErrorData> {
         let auth = auth_of(&ctx)?;
         let id = uuid_arg("conversation_id", &args.conversation_id)?;
         store::leave(&self.db, &auth, id).await?;
-        Ok(Json(serde_json::json!({ "left": args.conversation_id })))
+        Ok(Json(LeftConversation {
+            left: args.conversation_id,
+        }))
     }
 
     #[tool(
@@ -521,17 +523,15 @@ impl Bus {
         &self,
         ctx: RequestContext<rmcp::RoleServer>,
         Parameters(args): Parameters<InboxConfirmArgs>,
-    ) -> Result<Json<serde_json::Value>, ErrorData> {
+    ) -> Result<Json<InboxConfirmed>, ErrorData> {
         let auth = auth_of(&ctx)?;
         let done = inbox::confirm(&self.db, &self.backends, &auth, &args.delivery_ids).await?;
-        Ok(Json(serde_json::json!({
-            "confirmed": done.confirmed.len(),
-            "of": args.delivery_ids.len(),
-            // Which ids, so a caller that lost the previous answer can tell
-            // what it may forget from what it is still owed.
-            "confirmed_ids": done.confirmed,
-            "already_confirmed": done.already_confirmed,
-        })))
+        Ok(Json(InboxConfirmed {
+            confirmed: done.confirmed.len(),
+            of: args.delivery_ids.len(),
+            confirmed_ids: done.confirmed.iter().map(Uuid::to_string).collect(),
+            already_confirmed: done.already_confirmed.iter().map(Uuid::to_string).collect(),
+        }))
     }
 
     #[tool(

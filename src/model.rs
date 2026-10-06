@@ -129,6 +129,33 @@ pub struct SessionCredential {
     pub expires_in_seconds: i64,
 }
 
+/// The result of `revoke_session`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RevokedSession {
+    /// The label of the session whose credential was revoked.
+    pub revoked_session: String,
+}
+
+/// The result of `leave_conversation`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LeftConversation {
+    /// The conversation you left.
+    pub left: String,
+}
+
+/// The result of `confirm_inbox_delivery`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct InboxConfirmed {
+    /// How many of the given ids this call confirmed.
+    pub confirmed: usize,
+    /// How many ids were given.
+    pub of: usize,
+    /// Which ids, so a caller that lost the previous answer can tell what it
+    /// may forget from what it is still owed.
+    pub confirmed_ids: Vec<String>,
+    pub already_confirmed: Vec<String>,
+}
+
 /// What a session credential proves, reported by `whoami`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SessionIdentity {

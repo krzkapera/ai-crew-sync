@@ -33,7 +33,7 @@ use sqlx::PgPool;
 use crate::{
     auth::AuthCtx,
     events::EventHub,
-    model::{DigestResult, SessionCredential, WhoAmI},
+    model::{DigestResult, RevokedSession, SessionCredential, WhoAmI},
     store,
 };
 
@@ -409,10 +409,12 @@ impl Bus {
         &self,
         ctx: RequestContext<rmcp::RoleServer>,
         Parameters(args): Parameters<RevokeSessionArgs>,
-    ) -> Result<Json<serde_json::Value>, ErrorData> {
+    ) -> Result<Json<RevokedSession>, ErrorData> {
         let auth = auth_of(&ctx)?;
         let label = store::sessions::revoke(&self.db, &auth, args.session.as_deref()).await?;
-        Ok(Json(serde_json::json!({ "revoked_session": label })))
+        Ok(Json(RevokedSession {
+            revoked_session: label,
+        }))
     }
 }
 
@@ -579,6 +581,32 @@ mod tests {
         assert_eq!(
             get("wait_for_updates")["properties"]["kinds"]["items"]["type"],
             "string"
+        );
+    }
+
+    /// MCP requires an output schema to be `type: object`. Cursor validates
+    /// the catalogue strictly and drops the whole server over one bad entry
+    /// (a `Json<serde_json::Value>` result has a schema with no type at all).
+    #[tokio::test]
+    async fn every_tool_output_schema_is_an_object() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .unwrap();
+        let bus = Bus::new(pool, EventHub::new());
+        let bad: Vec<String> = bus
+            .tool_router
+            .list_all()
+            .iter()
+            .filter_map(|tool| {
+                let schema = tool.output_schema.as_ref()?;
+                (schema.get("type") != Some(&Value::String("object".into())))
+                    .then(|| format!("{}: {}", tool.name, Value::Object((**schema).clone())))
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "output schemas without type object:\n{}",
+            bad.join("\n")
         );
     }
 }
